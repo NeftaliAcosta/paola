@@ -1,0 +1,7 @@
+/paola
+.paola/
+.DS_Store
+.codegraph/
+snapshots/
+paola_source*.txt
+.github/context-mode/
