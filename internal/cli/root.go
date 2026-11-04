@@ -45,6 +45,32 @@ func init() {
 			if err := gitutil.EnsureLocalExclude(root); err != nil {
 				return fmt.Errorf("update local Git exclusions: %w", err)
 			}
+			tracked, err := gitutil.TrackedLocalWorkspace(root)
+			if err != nil {
+				return fmt.Errorf("check local PAOLA workspace tracking: %w", err)
+			}
+			if len(tracked) > 0 {
+				untrack := false
+				form := huh.NewForm(huh.NewGroup(
+					huh.NewConfirm().
+						Title(".paola/ is already tracked by Git.").
+						Description("Git exclusions do not affect files already committed. Remove .paola/ from the index while preserving all local files?").
+						Affirmative("Remove from Git").
+						Negative("Keep tracked").
+						Value(&untrack),
+				))
+				if err := form.Run(); err != nil {
+					return err
+				}
+				if untrack {
+					if err := gitutil.UntrackLocalWorkspace(root); err != nil {
+						return fmt.Errorf("untrack local PAOLA workspace: %w", err)
+					}
+					fmt.Println(".paola/ removed from the Git index; local files were preserved. Review and commit this Git change.")
+				} else {
+					fmt.Println("Warning: .paola/ remains tracked by Git; local exclusions cannot hide files already committed.")
+				}
+			}
 		}
 		return nil
 	}}

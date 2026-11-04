@@ -90,6 +90,32 @@ func EnsureLocalExclude(root string) error {
 	return cleanLocalPaolaIndex(root)
 }
 
+// TrackedLocalWorkspace reports workspace files that are already tracked by
+// Git. Local exclude rules cannot affect files that were committed previously.
+func TrackedLocalWorkspace(root string) ([]string, error) {
+	b, err := run(root, "ls-files", "-z", "--", ".paola/")
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, path := range strings.Split(string(b), "\x00") {
+		if path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths, nil
+}
+
+// UntrackLocalWorkspace removes .paola/ from Git's index without deleting
+// the local workspace. The resulting index change is intentionally left for
+// the user to review and commit; PAOLA must never create a project commit.
+func UntrackLocalWorkspace(root string) error {
+	if _, err := run(root, "rm", "--cached", "-r", "--ignore-unmatch", "--", ".paola/"); err != nil {
+		return err
+	}
+	return nil
+}
+
 // cleanLocalPaolaIndex removes staged additions and empty intent-to-add
 // placeholders for the tool-owned workspace. It never removes working-tree
 // files or changes existing commits.
