@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -145,7 +146,7 @@ func runCommand(*cobra.Command, []string) error {
 		return err
 	}
 	if headless {
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer cancel()
 		e := &orchestrator.Engine{Root: r, Config: c, Runner: agent.Runner{}, Control: orchestrator.NewControl(cancel), TaskBranch: branch.Task, BaseBranch: branch.Base, Log: func(s string) { fmt.Println(s) }}
 		return e.Run(ctx)
@@ -201,6 +202,23 @@ func prepareRunBranch(root string, c config.Config, headlessMode bool, requested
 	if err != nil {
 		return gitutil.BranchInfo{}, err
 	}
+	taskBranch := gitutil.TaskBranch(c.TaskTitle)
+	// A stopped or interrupted run may leave the worktree dirty on its own
+	// task branch. Resume that branch in place; checking out the base branch
+	// would make Git reject the run to protect the user's changes.
+	if current == taskBranch && gitutil.HasBranch(root, taskBranch) {
+		base := requestedBase
+		if base == "" {
+			base = current
+			for _, candidate := range []string{"main", "master"} {
+				if containsString(branches, candidate) {
+					base = candidate
+					break
+				}
+			}
+		}
+		return gitutil.BranchInfo{Base: base, Task: taskBranch}, nil
+	}
 	base := requestedBase
 	if base == "" {
 		base = current
@@ -222,7 +240,6 @@ func prepareRunBranch(root string, c config.Config, headlessMode bool, requested
 		}
 	}
 
-	taskBranch := gitutil.TaskBranch(c.TaskTitle)
 	if gitutil.HasBranch(root, taskBranch) {
 		if !headlessMode {
 			choice := "continue"
@@ -271,7 +288,7 @@ func containsString(values []string, target string) bool {
 }
 
 func runInteractive(root string, c config.Config, branch gitutil.BranchInfo) error {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 	control := orchestrator.NewControl(cancel)
 	p := tui.New(filepath.Base(root), control)

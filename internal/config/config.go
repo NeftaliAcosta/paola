@@ -20,13 +20,14 @@ type AgentCommand struct {
 	Judge    string `yaml:"judge"`
 }
 type Config struct {
-	ProjectName string                  `yaml:"project_name"`
-	TaskTitle   string                  `yaml:"task_title"`
-	TestCommand string                  `yaml:"test_command"`
-	MaxRetries  int                     `yaml:"max_retries"`
-	Agents      map[string]string       `yaml:"agents"`
-	Models      map[string]string       `yaml:"models"`
-	Commands    map[string]AgentCommand `yaml:"commands"`
+	ProjectName             string                  `yaml:"project_name"`
+	TaskTitle               string                  `yaml:"task_title"`
+	TestCommand             string                  `yaml:"test_command"`
+	MaxRetries              int                     `yaml:"max_retries"`
+	AgentIdleTimeoutMinutes int                     `yaml:"agent_idle_timeout_minutes,omitempty"`
+	Agents                  map[string]string       `yaml:"agents"`
+	Models                  map[string]string       `yaml:"models"`
+	Commands                map[string]AgentCommand `yaml:"commands"`
 }
 type State struct {
 	CurrentTask int      `json:"current_task"`
@@ -36,7 +37,7 @@ type State struct {
 }
 
 func Default(project string) Config {
-	return Config{ProjectName: project, TaskTitle: "", MaxRetries: 3, Agents: map[string]string{"coder": "codex", "reviewer": "codex", "judge": "agy"}, Models: map[string]string{"coder": "", "reviewer": "", "judge": ""}, Commands: map[string]AgentCommand{
+	return Config{ProjectName: project, TaskTitle: "", MaxRetries: 3, AgentIdleTimeoutMinutes: 30, Agents: map[string]string{"coder": "codex", "reviewer": "codex", "judge": "agy"}, Models: map[string]string{"coder": "", "reviewer": "", "judge": ""}, Commands: map[string]AgentCommand{
 		"agy":    {Coder: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Reviewer: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Judge: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`},
 		"codex":  {Coder: `codex exec --full-auto {{model_args}} {{prompt}}`, Reviewer: `codex exec {{model_args}} {{prompt}}`, Judge: `codex exec {{model_args}} {{prompt}}`},
 		"claude": {Coder: `claude --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Reviewer: `claude --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Judge: `claude --dangerously-skip-permissions {{model_args}} -p {{prompt}}`},

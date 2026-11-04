@@ -183,6 +183,9 @@ func HasBranch(root, branch string) bool {
 }
 
 func CheckoutTaskBranch(root, base, task string) error {
+	if current, err := CurrentBranch(root); err == nil && current == task {
+		return nil
+	}
 	if output, err := run(root, "checkout", base); err != nil {
 		return fmt.Errorf("unable to checkout base branch %q: %s", base, strings.TrimSpace(string(output)))
 	}

@@ -110,7 +110,14 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 	promptPath := filepath.Join(e.Root, config.Dir, "state", "current_prompt.md")
 	_ = os.Remove(promptPath)
 	defer func() { _ = os.Remove(promptPath) }()
-	defer func() { _ = record.FinishWithError(runStatus, errorText(runErr)) }()
+	defer func() {
+		if runErr != nil && ctx.Err() != nil {
+			runStatus = "interrupted"
+			state.Status = "interrupted"
+			_ = config.SaveState(e.Root, state)
+		}
+		_ = record.FinishWithError(runStatus, errorText(runErr))
+	}()
 	if state.Status == "" {
 		state.Status = "running"
 	}
@@ -313,7 +320,13 @@ func (e *Engine) runAgent(ctx context.Context, role, prompt string) (string, err
 	if role == "judge" {
 		template = commands.Judge
 	}
-	logs := make(chan string)
+	timeoutMinutes := e.Config.AgentIdleTimeoutMinutes
+	if timeoutMinutes <= 0 {
+		timeoutMinutes = 30
+	}
+	ctx, cancel := context.WithCancel(agent.WithIdleTimeout(ctx, time.Duration(timeoutMinutes)*time.Minute))
+	defer cancel()
+	logs := make(chan string, 256)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

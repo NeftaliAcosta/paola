@@ -15,7 +15,10 @@ import (
 type lineMsg string
 type progressMsg orchestrator.Progress
 type doneMsg struct{}
+type renderMsg struct{}
 type clockMsg time.Time
+
+const maxLiveLogLines = 3000
 
 var logTokenRE = regexp.MustCompile(`//.*|#.*|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\b(?:class|function|public|private|protected|namespace|use|return|if|else|elseif|foreach|for|new|extends|implements|const|var|let|interface|true|false|null)\b|\b\d+(?:\.\d+)?\b`)
 
@@ -38,15 +41,16 @@ var (
 )
 
 type model struct {
-	viewport     viewport.Model
-	roadmap      viewport.Model
-	roadmapFocus bool
-	lines        []string
-	title        string
-	progress     orchestrator.Progress
-	control      *orchestrator.Control
-	width        int
-	height       int
+	viewport      viewport.Model
+	roadmap       viewport.Model
+	roadmapFocus  bool
+	lines         []string
+	title         string
+	progress      orchestrator.Progress
+	control       *orchestrator.Control
+	width         int
+	height        int
+	renderPending bool
 }
 
 func New(title string, control *orchestrator.Control) *tea.Program {
@@ -70,6 +74,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := msg.(type) {
 	case lineMsg:
 		m.lines = append(m.lines, string(v))
+		if len(m.lines) > maxLiveLogLines {
+			m.lines = m.lines[len(m.lines)-maxLiveLogLines:]
+		}
+		if !m.renderPending {
+			m.renderPending = true
+			return m, tea.Tick(75*time.Millisecond, func(time.Time) tea.Msg { return renderMsg{} })
+		}
+	case renderMsg:
+		m.renderPending = false
 		m.viewport.SetContent(renderLogLines(m.lines))
 		m.viewport.GotoBottom()
 	case progressMsg:
