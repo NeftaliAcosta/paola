@@ -103,11 +103,12 @@ func RunWithFiles(root string, files FileOptions) error {
 		return err
 	}
 	test := ""
-	retries := "3"
+	retries := "1"
 	taskTitle := ""
 	coderPrompt, reviewerPrompt, judgePrompt := defaultCoder, defaultReviewer, defaultJudge
 	coder, reviewer, judge := "codex", "codex", "agy"
 	modelCoder, modelReviewer, modelJudge := "", "", ""
+	effortCoder, effortReviewer, effortJudge := "medium", "low", "low"
 	savedContext, savedObjective, savedRoadmap, savedRules := "", "", "", ""
 	savedTest, savedRetries, savedTitle := "", "", ""
 	savedCoderPrompt, savedReviewerPrompt, savedJudgePrompt := "", "", ""
@@ -154,9 +155,19 @@ func RunWithFiles(root string, files FileOptions) error {
 			judge = value
 		}
 		savedModelCoder, savedModelReviewer, savedModelJudge = c.Models["coder"], c.Models["reviewer"], c.Models["judge"]
+		effortCoder, effortReviewer, effortJudge = c.Budget("coder").Effort, c.Budget("reviewer").Effort, c.Budget("judge").Effort
 		modelCoder, modelReviewer, modelJudge = "", "", ""
 		savedTitle = c.TaskTitle
 		taskTitle = ""
+	}
+	if effortCoder == "" {
+		effortCoder = "medium"
+	}
+	if effortReviewer == "" {
+		effortReviewer = "low"
+	}
+	if effortJudge == "" {
+		effortJudge = "low"
 	}
 	form := huh.NewForm(
 		huh.NewGroup(
@@ -181,11 +192,14 @@ func RunWithFiles(root string, files FileOptions) error {
 			huh.NewInput().Title("Coder model (optional)").Description("Example: sonnet, o3, gpt-5").Value(&modelCoder),
 			huh.NewInput().Title("Reviewer model (optional)").Value(&modelReviewer),
 			huh.NewInput().Title("Judge model (optional)").Value(&modelJudge),
+			huh.NewSelect[string]().Title("Coder effort").Options(huh.NewOptions("low", "medium", "high")...).Value(&effortCoder),
+			huh.NewSelect[string]().Title("Reviewer effort").Options(huh.NewOptions("low", "medium", "high")...).Value(&effortReviewer),
+			huh.NewSelect[string]().Title("Judge effort").Options(huh.NewOptions("low", "medium", "high")...).Value(&effortJudge),
 		).Title("6/7 · Assign local AI tools").Description(step("You can use the same CLI for multiple roles.")),
 		huh.NewGroup(
 			huh.NewText().Title("What rules must always be followed?").Description("Coding standards, forbidden patterns, security rules, and Definition of Done. Ctrl+E opens $EDITOR.").CharLimit(0).Value(&rules),
 			huh.NewInput().Title("Test/build command (optional)").Description("Example: go test ./... or npm test").Value(&test),
-			huh.NewInput().Title("Retries before Judge").Description("Default: 3").Value(&retries),
+			huh.NewInput().Title("Retries before Judge").Description("Default: 1").Value(&retries),
 		).Title("7/7 · Rules and validation").Description(step("The test command runs locally before an agent review.")),
 	).WithKeyMap(wizardKeyMap()).WithShowHelp(true)
 	if err := form.Run(); err != nil {
@@ -290,6 +304,12 @@ func RunWithFiles(root string, files FileOptions) error {
 		c.Models = map[string]string{}
 	}
 	c.Models["coder"], c.Models["reviewer"], c.Models["judge"] = strings.TrimSpace(modelCoder), strings.TrimSpace(modelReviewer), strings.TrimSpace(modelJudge)
+	if c.Budgets == nil {
+		c.Budgets = config.Default(project).Budgets
+	}
+	c.Budgets["coder"] = config.RoleBudget{MaxTurns: c.Budget("coder").MaxTurns, Effort: effortCoder, MaxInputChars: c.Budget("coder").MaxInputChars, MaxOutputChars: c.Budget("coder").MaxOutputChars}
+	c.Budgets["reviewer"] = config.RoleBudget{MaxTurns: c.Budget("reviewer").MaxTurns, Effort: effortReviewer, MaxInputChars: c.Budget("reviewer").MaxInputChars, MaxOutputChars: c.Budget("reviewer").MaxOutputChars}
+	c.Budgets["judge"] = config.RoleBudget{MaxTurns: c.Budget("judge").MaxTurns, Effort: effortJudge, MaxInputChars: c.Budget("judge").MaxInputChars, MaxOutputChars: c.Budget("judge").MaxOutputChars}
 
 	if err := config.EnsureDir(root); err != nil {
 		return err

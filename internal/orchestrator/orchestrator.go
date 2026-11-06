@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/neftaliacosta/paola/internal/agent"
 	"github.com/neftaliacosta/paola/internal/config"
@@ -80,6 +81,7 @@ type Engine struct {
 	Control    *Control
 	TaskBranch string
 	BaseBranch string
+	Sessions   map[string]string
 }
 
 func (e *Engine) emit(s string) {
@@ -96,6 +98,13 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 	}
 	lines := strings.Split(string(b), "\n")
 	state, _ := config.LoadState(e.Root)
+	if e.Sessions == nil {
+		e.Sessions = state.Sessions
+	}
+	if e.Sessions == nil {
+		e.Sessions = map[string]string{}
+	}
+	maxRetries := e.maxRetries()
 	indexes := pendingTaskIndexes(lines)
 	if len(indexes) == 0 {
 		// A completed roadmap is not a new execution. Avoid creating an empty
@@ -111,6 +120,8 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 	_ = os.Remove(promptPath)
 	defer func() { _ = os.Remove(promptPath) }()
 	defer func() {
+		state.Sessions = e.Sessions
+		_ = config.SaveState(e.Root, state)
 		if runErr != nil && ctx.Err() != nil {
 			runStatus = "interrupted"
 			state.Status = "interrupted"
@@ -139,6 +150,8 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 
 		completed := false
 		reviewRounds := 0
+		metrics := map[string]history.AgentMetric{}
+		turns := map[string]int{}
 		for !completed {
 			if err := e.wait(ctx); err != nil {
 				return err
@@ -155,10 +168,11 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Coder", coder, "")
 			prompt, _ := e.prompt("coder", task)
 			_ = os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "current_prompt.md"), []byte(prompt), 0600)
-			e.emit(fmt.Sprintf("Coder attempt %d/%d (%s)", state.Attempt, e.Config.MaxRetries, coder))
-			coderOutput, err := e.runAgent(ctx, "coder", prompt)
+			e.emit(fmt.Sprintf("Coder attempt %d/%d (%s)", state.Attempt, maxRetries, coder))
+			coderOutput, err := e.runRole(ctx, "coder", prompt, turns, metrics)
 			_ = record.Log(ordinal+1, "coder", coderOutput)
 			if err != nil {
+				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
 				return err
 			}
 
@@ -172,7 +186,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 						return err
 					}
 					e.emit("Tests failed; returning to Coder")
-					if state.Attempt >= e.Config.MaxRetries {
+					if state.Attempt >= maxRetries {
 						return fmt.Errorf("tests failed after %d attempts", state.Attempt)
 					}
 					continue
@@ -183,6 +197,9 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			if err != nil {
 				return fmt.Errorf("capture Git diff for task %q: %w", task, err)
 			}
+			if strings.TrimSpace(diff) == "" && !e.Config.Simulation {
+				return fmt.Errorf("coder completed without project changes for task %q; task gate blocked advancement", task)
+			}
 			if err := os.WriteFile(gitutil.SafeDiffPath(e.Root), []byte(diff), 0644); err != nil {
 				return err
 			}
@@ -192,9 +209,11 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Reviewer", reviewer, "")
 			reviewPrompt, _ := e.prompt("reviewer", task)
 			e.emit("Reviewer (" + reviewer + ")")
-			review, err := e.runAgent(ctx, "reviewer", reviewPrompt+"\nCURRENT DIFF:\n"+diff)
+			reviewInput := limitText(reviewPrompt+"\nCURRENT DIFF:\n"+diff, e.budget("reviewer").MaxInputChars)
+			review, err := e.runRole(ctx, "reviewer", reviewInput, turns, metrics)
 			_ = record.Log(ordinal+1, "reviewer", review)
 			if err != nil {
+				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
 				return err
 			}
 			if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(review), 0644); err != nil {
@@ -205,7 +224,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				e.emit("✓ reviewer approved")
 				break
 			}
-			if state.Attempt < e.Config.MaxRetries {
+			if state.Attempt < maxRetries {
 				e.emit("Reviewer requested changes")
 				continue
 			}
@@ -214,9 +233,11 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Judge", judge, "")
 			judgePrompt, _ := e.prompt("judge", task)
 			e.emit("Judge (" + judge + ")")
-			verdict, err := e.runAgent(ctx, "judge", judgePrompt+"\nREVIEW:\n"+review+"\nCURRENT DIFF:\n"+diff)
+			judgeInput := limitText(judgePrompt+"\nREVIEW:\n"+review+"\nCURRENT DIFF:\n"+diff, e.budget("judge").MaxInputChars)
+			verdict, err := e.runRole(ctx, "judge", judgeInput, turns, metrics)
 			_ = record.Log(ordinal+1, "judge", verdict)
 			if err != nil {
+				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
 				return err
 			}
 			if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(verdict), 0644); err != nil {
@@ -238,9 +259,10 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			state.Attempt++
 			coderPrompt, _ := e.prompt("coder", task)
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Coder (bonus)", coder, "FINAL_INSTRUCTIONS")
-			bonusOutput, err := e.runAgent(ctx, "coder", coderPrompt)
+			bonusOutput, err := e.runRole(ctx, "coder", coderPrompt, turns, metrics)
 			_ = record.Log(ordinal+1, "coder-bonus", bonusOutput)
 			if err != nil {
+				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
 				return fmt.Errorf("final coder turn failed: %w", err)
 			}
 			if e.Config.TestCommand != "" {
@@ -265,9 +287,13 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 		}
 		if completed {
 			_ = record.UpdateTask(ordinal+1, "completed", "", tokenCountFromFiles(e.Root), gitutil.ChangedFiles(e.Root), state.Attempt, reviewRounds)
+			_ = record.UpdateTaskMetrics(ordinal+1, metrics)
+			_ = writeContextSummary(e.Root, task, metrics)
 			_ = os.Remove(promptPath)
-			if err := completeTask(e.Root, roadmapPath, lines, idx, task, state); err != nil {
-				return err
+			if !e.Config.Simulation {
+				if err := completeTask(e.Root, roadmapPath, lines, idx, task, state); err != nil {
+					return err
+				}
 			}
 			lines[idx] = strings.Replace(lines[idx], "- [ ]", "- [x]", 1)
 		}
@@ -294,6 +320,10 @@ func (e *Engine) wait(ctx context.Context) error {
 	return e.Control.Wait(ctx)
 }
 
+func (e *Engine) maxRetries() int {
+	return e.Config.EffectiveMaxRetries()
+}
+
 func (e *Engine) progress(tasks []Task, current, ordinal, attempt int, role, cli, verdict string) {
 	if e.Update == nil {
 		return
@@ -302,12 +332,157 @@ func (e *Engine) progress(tasks []Task, current, ordinal, attempt int, role, cli
 	if current >= 0 && current < len(copyTasks) && copyTasks[current].Status != "done" {
 		copyTasks[current].Status = "current"
 	}
-	e.Update(Progress{Project: e.Config.ProjectName, Tasks: copyTasks, CurrentTask: ordinal, TotalTasks: len(copyTasks), Attempt: attempt, MaxRetries: e.Config.MaxRetries, Role: role, CLI: cli, RoleAgents: e.Config.Agents, Verdict: verdict, Paused: e.Control != nil && e.Control.IsPaused()})
+	e.Update(Progress{Project: e.Config.ProjectName, Tasks: copyTasks, CurrentTask: ordinal, TotalTasks: len(copyTasks), Attempt: attempt, MaxRetries: e.maxRetries(), Role: role, CLI: cli, RoleAgents: e.Config.Agents, Verdict: verdict, Paused: e.Control != nil && e.Control.IsPaused()})
 }
 
 func (e *Engine) prompt(role, task string) (string, error) {
 	read := func(n string) string { b, _ := os.ReadFile(filepath.Join(e.Root, config.Dir, n)); return string(b) }
-	return fmt.Sprintf("ROLE:\n%s\nCONTEXT:\n%s\nRULES:\n%s\nTASK:\n%s\nFEEDBACK:\n%s", read("roles/"+role+".md"), read("CONTEXT.md"), read("GOLDEN_RULES.md"), task, read("state/feedback.md")), nil
+	rolePrompt := read("roles/" + role + ".md")
+	rules := limitText(read("GOLDEN_RULES.md"), 10000)
+	summary := limitText(read("state/context_summary.md"), 6000)
+	feedback := limitText(read("state/feedback.md"), 10000)
+	contextText := limitText(read("CONTEXT.md"), 12000)
+	if summary == "" {
+		summary = "No previous task summary."
+	}
+	if role != "coder" {
+		contextText = "Use current diff and task evidence; full project context is intentionally omitted to reduce repetition."
+	}
+	prompt := fmt.Sprintf("ROLE:\n%s\nCONTEXT:\n%s\nRULES:\n%s\nTASK:\n%s\nSUMMARY:\n%s\nFEEDBACK:\n%s", rolePrompt, contextText, rules, task, summary, feedback)
+	return limitText(prompt, e.budget(role).MaxInputChars), nil
+}
+
+func (e *Engine) budget(role string) config.RoleBudget { return e.Config.Budget(role) }
+
+func (e *Engine) runRole(ctx context.Context, role, prompt string, turns map[string]int, metrics map[string]history.AgentMetric) (string, error) {
+	budget := e.budget(role)
+	turns[role]++
+	if budget.MaxTurns > 0 && turns[role] > budget.MaxTurns {
+		return "", fmt.Errorf("%s budget exhausted: maximum %d turns reached", role, budget.MaxTurns)
+	}
+	started := time.Now()
+	roleCtx := agent.WithEffort(ctx, budget.Effort)
+	if e.Config.ReuseSessions {
+		roleCtx = agent.WithSession(roleCtx, e.Sessions[role])
+	}
+	rawOutput, err := e.runAgent(roleCtx, role, prompt)
+	output := limitOutput(rawOutput, budget.MaxOutputChars)
+	if e.Config.ReuseSessions {
+		if session := extractSessionID(output); session != "" {
+			e.Sessions[role] = session
+		}
+	}
+	key := role
+	if turns[role] > 1 {
+		key = fmt.Sprintf("%s#%d", role, turns[role])
+	}
+	status := "completed"
+	if err != nil {
+		status = "failed"
+		message := fmt.Sprintf("%s failed: %v\n\nRecovery: inspect the last output, correct the agent configuration or quota issue, then rerun the pending task.", role, err)
+		_ = os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(message), 0644)
+		e.emit("✗ " + message)
+	}
+	metrics[key] = history.AgentMetric{Role: role, CLI: e.Config.Agents[role], Model: e.Config.Models[role], Effort: budget.Effort, Turns: turns[role], InputChars: len(prompt), OutputChars: len(rawOutput), Duration: time.Since(started), Status: status}
+	return output, err
+}
+
+var sessionIDRE = regexp.MustCompile(`(?i)(?:session[_ -]?id|sessionId)\s*[=:]\s*["']?([a-z0-9-]{16,})`)
+
+func extractSessionID(output string) string {
+	match := sessionIDRE.FindStringSubmatch(output)
+	if len(match) == 2 {
+		return match[1]
+	}
+	return ""
+}
+
+func writeContextSummary(root, task string, metrics map[string]history.AgentMetric) error {
+	var b strings.Builder
+	b.WriteString("# Incremental task summary\n\n")
+	b.WriteString("Completed task: " + task + "\n\n")
+	b.WriteString("Files: " + strings.Join(gitutil.ChangedFiles(root), ", ") + "\n")
+	b.WriteString("Agents:\n")
+	for name, metric := range metrics {
+		fmt.Fprintf(&b, "- %s: %s, %d input chars, %d output chars, %s\n", name, metric.Status, metric.InputChars, metric.OutputChars, metric.Duration.Round(time.Millisecond))
+	}
+	testOutput, _ := os.ReadFile(filepath.Join(root, config.Dir, "state", "test_output.log"))
+	if len(testOutput) > 3000 {
+		testOutput = testOutput[len(testOutput)-3000:]
+	}
+	b.WriteString("\nLatest validation output:\n```\n")
+	b.Write(testOutput)
+	b.WriteString("\n```\n")
+	return os.WriteFile(filepath.Join(root, config.Dir, "state", "context_summary.md"), []byte(b.String()), 0644)
+}
+
+func limitText(value string, max int) string {
+	value = normalizeUTF8(value)
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	marker := "\n\n[PAOLA: context truncated to respect role budget]\n"
+	if len(marker) >= max {
+		return utf8Prefix(value, max)
+	}
+	return utf8Prefix(value, max-len(marker)) + marker
+}
+
+func limitOutput(value string, max int) string {
+	value = normalizeUTF8(value)
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	marker := "\n\n[PAOLA: agent output truncated to respect role budget]\n\n"
+	if max <= len(marker)+2 {
+		return utf8Prefix(value, max)
+	}
+	remaining := max - len(marker)
+	head := remaining * 3 / 4
+	tail := remaining - head
+	return utf8Prefix(value, head) + marker + utf8Suffix(value, tail)
+}
+
+func normalizeUTF8(value string) string {
+	if utf8.ValidString(value) {
+		return value
+	}
+	return strings.ToValidUTF8(value, "�")
+}
+
+func utf8Prefix(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	maxBytes = minInt(maxBytes, len(value))
+	for maxBytes > 0 && !utf8.ValidString(value[:maxBytes]) {
+		maxBytes--
+	}
+	return value[:maxBytes]
+}
+
+func utf8Suffix(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	start := len(value) - maxBytes
+	for start < len(value) && !utf8.ValidString(value[start:]) {
+		start++
+	}
+	return value[start:]
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func (e *Engine) runAgent(ctx context.Context, role, prompt string) (string, error) {
@@ -320,10 +495,17 @@ func (e *Engine) runAgent(ctx context.Context, role, prompt string) (string, err
 	if role == "judge" {
 		template = commands.Judge
 	}
-	timeoutMinutes := e.Config.AgentIdleTimeoutMinutes
-	if timeoutMinutes <= 0 {
-		timeoutMinutes = 30
+	if e.Config.Simulation {
+		switch role {
+		case "reviewer":
+			return "SIMULATION\nSTATUS: LGTM", nil
+		case "judge":
+			return "SIMULATION\nVERDICT: OVERRIDE_APPROVE", nil
+		default:
+			return "SIMULATION\nNo agent invoked and no files changed.", nil
+		}
 	}
+	timeoutMinutes := e.Config.EffectiveIdleTimeoutMinutes()
 	ctx, cancel := context.WithCancel(agent.WithIdleTimeout(ctx, time.Duration(timeoutMinutes)*time.Minute))
 	defer cancel()
 	logs := make(chan string, 256)

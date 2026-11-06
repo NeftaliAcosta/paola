@@ -19,30 +19,72 @@ type AgentCommand struct {
 	Reviewer string `yaml:"reviewer"`
 	Judge    string `yaml:"judge"`
 }
+
+type RoleBudget struct {
+	MaxTurns       int    `yaml:"max_turns,omitempty"`
+	Effort         string `yaml:"effort,omitempty"`
+	MaxInputChars  int    `yaml:"max_input_chars,omitempty"`
+	MaxOutputChars int    `yaml:"max_output_chars,omitempty"`
+}
+
 type Config struct {
 	ProjectName             string                  `yaml:"project_name"`
 	TaskTitle               string                  `yaml:"task_title"`
 	TestCommand             string                  `yaml:"test_command"`
 	MaxRetries              int                     `yaml:"max_retries"`
 	AgentIdleTimeoutMinutes int                     `yaml:"agent_idle_timeout_minutes,omitempty"`
+	Simulation              bool                    `yaml:"simulation,omitempty"`
+	ReuseSessions           bool                    `yaml:"reuse_sessions,omitempty"`
+	Budgets                 map[string]RoleBudget   `yaml:"budgets,omitempty"`
 	Agents                  map[string]string       `yaml:"agents"`
 	Models                  map[string]string       `yaml:"models"`
 	Commands                map[string]AgentCommand `yaml:"commands"`
 }
 type State struct {
-	CurrentTask int      `json:"current_task"`
-	Attempt     int      `json:"attempt"`
-	Status      string   `json:"status"`
-	History     []string `json:"history"`
+	CurrentTask int               `json:"current_task"`
+	Attempt     int               `json:"attempt"`
+	Status      string            `json:"status"`
+	History     []string          `json:"history"`
+	Sessions    map[string]string `json:"sessions,omitempty"`
 }
 
 func Default(project string) Config {
-	return Config{ProjectName: project, TaskTitle: "", MaxRetries: 3, AgentIdleTimeoutMinutes: 30, Agents: map[string]string{"coder": "codex", "reviewer": "codex", "judge": "agy"}, Models: map[string]string{"coder": "", "reviewer": "", "judge": ""}, Commands: map[string]AgentCommand{
+	return Config{ProjectName: project, TaskTitle: "", MaxRetries: 1, AgentIdleTimeoutMinutes: 30, Budgets: defaultBudgets(), Agents: map[string]string{"coder": "codex", "reviewer": "codex", "judge": "agy"}, Models: map[string]string{"coder": "", "reviewer": "", "judge": ""}, Commands: map[string]AgentCommand{
 		"agy":    {Coder: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Reviewer: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Judge: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`},
-		"codex":  {Coder: `codex exec --full-auto {{model_args}} {{prompt}}`, Reviewer: `codex exec {{model_args}} {{prompt}}`, Judge: `codex exec {{model_args}} {{prompt}}`},
-		"claude": {Coder: `claude --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Reviewer: `claude --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Judge: `claude --dangerously-skip-permissions {{model_args}} -p {{prompt}}`},
+		"codex":  {Coder: `codex exec --full-auto {{model_args}} {{effort_args}} {{prompt}}`, Reviewer: `codex exec {{model_args}} {{effort_args}} {{prompt}}`, Judge: `codex exec {{model_args}} {{effort_args}} {{prompt}}`},
+		"claude": {Coder: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} -p {{prompt}}`, Reviewer: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} -p {{prompt}}`, Judge: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} -p {{prompt}}`},
 	}}
 }
+
+func defaultBudgets() map[string]RoleBudget {
+	return map[string]RoleBudget{
+		"coder":    {MaxTurns: 2, Effort: "medium", MaxInputChars: 24000, MaxOutputChars: 60000},
+		"reviewer": {MaxTurns: 2, Effort: "low", MaxInputChars: 50000, MaxOutputChars: 30000},
+		"judge":    {MaxTurns: 1, Effort: "low", MaxInputChars: 50000, MaxOutputChars: 20000},
+	}
+}
+
+func (c Config) Budget(role string) RoleBudget {
+	if budget, ok := c.Budgets[role]; ok {
+		return budget
+	}
+	return defaultBudgets()[role]
+}
+
+func (c Config) EffectiveMaxRetries() int {
+	if c.MaxRetries > 0 {
+		return c.MaxRetries
+	}
+	return 1
+}
+
+func (c Config) EffectiveIdleTimeoutMinutes() int {
+	if c.AgentIdleTimeoutMinutes > 0 {
+		return c.AgentIdleTimeoutMinutes
+	}
+	return 30
+}
+
 func Load(root string) (Config, error) {
 	var c Config
 	b, err := os.ReadFile(filepath.Join(root, Dir, "config.yaml"))
@@ -50,9 +92,6 @@ func Load(root string) (Config, error) {
 		return c, err
 	}
 	err = yaml.Unmarshal(b, &c)
-	if c.MaxRetries < 1 {
-		c.MaxRetries = 3
-	}
 	return c, err
 }
 func Save(root string, c Config) error {

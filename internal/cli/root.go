@@ -28,6 +28,7 @@ const version = "0.1.10"
 var (
 	headless      bool
 	baseBranch    string
+	simulate      bool
 	contextFile   string
 	objectiveFile string
 	roadmapFile   string
@@ -83,6 +84,7 @@ func init() {
 	run := &cobra.Command{Use: "run", Short: "Run the autonomous roadmap", RunE: runCommand}
 	run.Flags().BoolVar(&headless, "headless", false, "disable the live terminal UI")
 	run.Flags().StringVar(&baseBranch, "base-branch", "", "base branch for the isolated task branch")
+	run.Flags().BoolVar(&simulate, "simulate", false, "exercise workflow without invoking agents or modifying project files")
 	rootCmd.AddCommand(run)
 	rootCmd.AddCommand(&cobra.Command{Use: "config", Short: "Show configuration and agent health", RunE: configCommand})
 	rootCmd.AddCommand(&cobra.Command{Use: "history", Short: "List previous orchestration runs", RunE: historyCommand})
@@ -109,7 +111,7 @@ func configCommand(*cobra.Command, []string) error {
 	}
 	fmt.Println("PAOLA CONFIG")
 	fmt.Println("────────────")
-	fmt.Printf("Project: %s\nRetries: %d\nTest: %s\n", c.ProjectName, c.MaxRetries, empty(c.TestCommand))
+	fmt.Printf("Project: %s\nRetries: %d\nIdle timeout: %d minutes\nSimulation: %t\nReuse sessions: %t\nTest: %s\n", c.ProjectName, c.EffectiveMaxRetries(), c.EffectiveIdleTimeoutMinutes(), c.Simulation, c.ReuseSessions, empty(c.TestCommand))
 	fmt.Println("Role      CLI")
 	for _, role := range []string{"coder", "reviewer", "judge"} {
 		model := c.Models[role]
@@ -141,9 +143,21 @@ func runCommand(*cobra.Command, []string) error {
 	if err != nil {
 		return fmt.Errorf(".paola not initialized: %w", err)
 	}
-	branch, err := prepareRunBranch(r, c, headless, baseBranch)
-	if err != nil {
-		return err
+	if simulate {
+		c.Simulation = true
+	}
+	var branch gitutil.BranchInfo
+	if simulate {
+		current, branchErr := gitutil.CurrentBranch(r)
+		if branchErr != nil {
+			return branchErr
+		}
+		branch = gitutil.BranchInfo{Base: current, Task: current}
+	} else {
+		branch, err = prepareRunBranch(r, c, headless, baseBranch)
+		if err != nil {
+			return err
+		}
 	}
 	if headless {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -614,6 +628,18 @@ func renderHistoryReport(run paolahistory.Manifest) string {
 		} else {
 			fmt.Fprintln(&b, "     Attempts/reviews: not recorded in this iteration")
 		}
+		if len(task.Metrics) > 0 {
+			fmt.Fprintln(&b, "     Agent metrics:")
+			for _, role := range []string{"coder", "reviewer", "judge"} {
+				for _, key := range []string{role, role + "#2", role + "#3"} {
+					metric, ok := task.Metrics[key]
+					if !ok {
+						continue
+					}
+					fmt.Fprintf(&b, "       %-10s %-8s · model: %s · effort: %s · turn %d · in %d · out %d · %s · %s\n", key, metric.CLI, empty(metric.Model), empty(metric.Effort), metric.Turns, metric.InputChars, metric.OutputChars, formatDuration(metric.Duration), strings.ToUpper(metric.Status))
+				}
+			}
+		}
 		if len(task.Files) > 0 {
 			fmt.Fprintf(&b, "     Files: %s\n", strings.Join(task.Files, ", "))
 		}
@@ -629,12 +655,15 @@ func renderHistoryReport(run paolahistory.Manifest) string {
 
 	fmt.Fprintln(&b, "\nPARAMETERS")
 	fmt.Fprintln(&b, "──────────")
-	fmt.Fprintf(&b, "Retries    %d\n", run.Config.MaxRetries)
+	fmt.Fprintf(&b, "Retries    %d\n", run.Config.EffectiveMaxRetries())
+	fmt.Fprintf(&b, "Idle limit %d min · Simulation %t · Session reuse %t\n", run.Config.EffectiveIdleTimeoutMinutes(), run.Config.Simulation, run.Config.ReuseSessions)
 	fmt.Fprintf(&b, "Test       %s\n", empty(run.Config.TestCommand))
 	for _, role := range []string{"coder", "reviewer", "judge"} {
 		cli := empty(run.Config.Agents[role])
 		model := empty(run.Config.Models[role])
-		fmt.Fprintf(&b, "%-10s %s · model: %s\n", roleLabel(role), cli, model)
+		budget := run.Config.Budget(role)
+		fmt.Fprintf(&b, "%-10s %s · model: %s · effort: %s · max turns: %d\n", roleLabel(role), cli, model, empty(budget.Effort), budget.MaxTurns)
+		fmt.Fprintf(&b, "%-10s input: %d chars · output: %d chars\n", "", budget.MaxInputChars, budget.MaxOutputChars)
 	}
 
 	return b.String()

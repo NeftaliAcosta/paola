@@ -30,17 +30,30 @@ type Manifest struct {
 	Tasks      []TaskRecord  `json:"tasks,omitempty"`
 }
 type TaskRecord struct {
-	Index        int           `json:"index"`
-	Description  string        `json:"description"`
-	Status       string        `json:"status"`
-	StartedAt    time.Time     `json:"started_at"`
-	FinishedAt   time.Time     `json:"finished_at"`
-	Duration     time.Duration `json:"duration_ns"`
-	Attempts     int           `json:"attempts,omitempty"`
-	ReviewRounds int           `json:"review_rounds,omitempty"`
-	Tokens       int           `json:"tokens,omitempty"`
-	Files        []string      `json:"files,omitempty"`
-	Error        string        `json:"error,omitempty"`
+	Index        int                    `json:"index"`
+	Description  string                 `json:"description"`
+	Status       string                 `json:"status"`
+	StartedAt    time.Time              `json:"started_at"`
+	FinishedAt   time.Time              `json:"finished_at"`
+	Duration     time.Duration          `json:"duration_ns"`
+	Attempts     int                    `json:"attempts,omitempty"`
+	ReviewRounds int                    `json:"review_rounds,omitempty"`
+	Tokens       int                    `json:"tokens,omitempty"`
+	Files        []string               `json:"files,omitempty"`
+	Error        string                 `json:"error,omitempty"`
+	Metrics      map[string]AgentMetric `json:"metrics,omitempty"`
+}
+
+type AgentMetric struct {
+	Role        string        `json:"role"`
+	CLI         string        `json:"cli"`
+	Model       string        `json:"model,omitempty"`
+	Effort      string        `json:"effort,omitempty"`
+	Turns       int           `json:"turns"`
+	InputChars  int           `json:"input_chars"`
+	OutputChars int           `json:"output_chars"`
+	Duration    time.Duration `json:"duration_ns"`
+	Status      string        `json:"status"`
 }
 type Recorder struct {
 	root     string
@@ -88,6 +101,16 @@ func (r *Recorder) UpdateTask(index int, status, errText string, tokens int, fil
 			r.manifest.Tasks[i].Files = files
 			r.manifest.Tasks[i].Attempts = attempts
 			r.manifest.Tasks[i].ReviewRounds = reviewRounds
+			return r.save()
+		}
+	}
+	return nil
+}
+
+func (r *Recorder) UpdateTaskMetrics(index int, metrics map[string]AgentMetric) error {
+	for i := range r.manifest.Tasks {
+		if r.manifest.Tasks[i].Index == index {
+			r.manifest.Tasks[i].Metrics = metrics
 			return r.save()
 		}
 	}

@@ -13,6 +13,7 @@ PAOLA runs agents inside your project, optionally runs deterministic tests, requ
 - Git task-branch isolation, diff capture, and Conventional Commit-style messages.
 - Encrypted and compressed manifests, agent logs, and diffs.
 - Interactive history with timelines and file-by-file diffs.
+- Role budgets, bounded context, incremental summaries, effort settings, and optional simulation.
 
 ## Requirements
 
@@ -68,6 +69,9 @@ Headless mode uses the current branch as the base unless one is supplied:
 ```sh
 paola run --headless
 paola run --headless --base-branch main
+
+# Validate the workflow without invoking an agent or changing project files
+paola run --simulate
 ```
 
 Interactive mode asks for the base branch, then creates or checks out a task branch such as `paola/crud-de-usuarios`. The branch is never merged automatically.
@@ -114,6 +118,36 @@ models:
 ```
 
 Reconfigure with `paola init`; existing history is preserved.
+
+### Cost and reliability controls
+
+The wizard writes conservative defaults: one retry, a 30-minute no-output timeout, and bounded turns/context per role. Adjust them in `.paola/config.yaml` when needed:
+
+```yaml
+max_retries: 1
+agent_idle_timeout_minutes: 30
+reuse_sessions: false
+budgets:
+  coder:
+    max_turns: 2
+    effort: medium
+    max_input_chars: 24000
+    max_output_chars: 60000
+  reviewer:
+    max_turns: 2
+    effort: low
+    max_input_chars: 50000
+    max_output_chars: 30000
+  judge:
+    max_turns: 1
+    effort: low
+    max_input_chars: 50000
+    max_output_chars: 20000
+```
+
+PAOLA sends only the context relevant to each role and maintains a compact `.paola/state/context_summary.md`. Reviewer and Judge receive the task evidence and diff, not the full project context. History records per-role CLI, model, effort, turns, input/output size, duration, and status.
+
+`reuse_sessions` is opt-in and currently best-effort: when a compatible CLI emits a session identifier, PAOLA can resume it on later turns. If no identifier is emitted, it safely starts a fresh invocation.
 
 ## Git behavior
 

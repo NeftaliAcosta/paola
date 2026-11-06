@@ -21,6 +21,8 @@ type Runner struct{}
 const defaultIdleTimeout = 30 * time.Minute
 
 type idleTimeoutContextKey struct{}
+type effortContextKey struct{}
+type sessionContextKey struct{}
 
 // WithIdleTimeout configures the maximum period an agent may remain silent.
 // Output from stdout or stderr resets the timer; active agents are not stopped.
@@ -38,6 +40,24 @@ func idleTimeout(ctx context.Context) time.Duration {
 	return defaultIdleTimeout
 }
 
+func WithEffort(ctx context.Context, effort string) context.Context {
+	return context.WithValue(ctx, effortContextKey{}, strings.TrimSpace(effort))
+}
+
+func effort(ctx context.Context) string {
+	value, _ := ctx.Value(effortContextKey{}).(string)
+	return value
+}
+
+func WithSession(ctx context.Context, sessionID string) context.Context {
+	return context.WithValue(ctx, sessionContextKey{}, strings.TrimSpace(sessionID))
+}
+
+func sessionID(ctx context.Context) string {
+	value, _ := ctx.Value(sessionContextKey{}).(string)
+	return value
+}
+
 func (Runner) Run(ctx context.Context, root, cli, template, prompt, model string, logs chan<- string) (string, error) {
 	if _, err := exec.LookPath(cli); err != nil {
 		return "", fmt.Errorf("agent %q not found in PATH", cli)
@@ -47,6 +67,27 @@ func (Runner) Run(ctx context.Context, root, cli, template, prompt, model string
 		modelArgs = "--model " + shellQuote(strings.TrimSpace(model))
 	}
 	command := strings.ReplaceAll(template, "{{model_args}}", modelArgs)
+	effortArgs := ""
+	if value := effort(ctx); value != "" {
+		switch cli {
+		case "claude":
+			effortArgs = "--effort " + shellQuote(value)
+		case "codex":
+			effortArgs = "-c model_reasoning_effort=" + shellQuote(value)
+		}
+	}
+	sessionArgs := ""
+	if value := sessionID(ctx); value != "" && cli == "claude" {
+		sessionArgs = "--resume " + shellQuote(value)
+	}
+	if effortArgs != "" && !strings.Contains(command, "{{effort_args}}") {
+		command = strings.Replace(command, "{{prompt}}", effortArgs+" {{prompt}}", 1)
+	}
+	if sessionArgs != "" && !strings.Contains(command, "{{session_args}}") {
+		command = strings.Replace(command, "{{prompt}}", sessionArgs+" {{prompt}}", 1)
+	}
+	command = strings.ReplaceAll(command, "{{effort_args}}", effortArgs)
+	command = strings.ReplaceAll(command, "{{session_args}}", sessionArgs)
 	command = strings.ReplaceAll(command, "{{prompt}}", shellQuote(prompt))
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
