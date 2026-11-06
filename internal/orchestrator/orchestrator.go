@@ -173,6 +173,13 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			_ = record.Log(ordinal+1, "coder", coderOutput)
 			if err != nil {
 				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
+				if retryableError(err) && state.Attempt < maxRetries {
+					e.emit(fmt.Sprintf("Retryable coder failure; retrying in %ds", e.Config.EffectiveRetryBackoffSeconds()))
+					if err := waitBackoff(ctx, e.Config.EffectiveRetryBackoffSeconds()); err != nil {
+						return err
+					}
+					continue
+				}
 				return err
 			}
 
@@ -186,6 +193,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 						return err
 					}
 					e.emit("Tests failed; returning to Coder")
+					_ = writeContextSummary(e.Root, task, metrics)
 					if state.Attempt >= maxRetries {
 						return fmt.Errorf("tests failed after %d attempts", state.Attempt)
 					}
@@ -193,9 +201,15 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				}
 			}
 
-			diff, err := gitutil.CaptureDiff(e.Root)
-			if err != nil {
-				return fmt.Errorf("capture Git diff for task %q: %w", task, err)
+			diff := ""
+			if e.Config.Simulation {
+				diff = "SIMULATION: no project diff captured.\n"
+			} else {
+				var diffErr error
+				diff, diffErr = gitutil.CaptureDiff(e.Root)
+				if diffErr != nil {
+					return fmt.Errorf("capture Git diff for task %q: %w", task, diffErr)
+				}
 			}
 			if strings.TrimSpace(diff) == "" && !e.Config.Simulation {
 				return fmt.Errorf("coder completed without project changes for task %q; task gate blocked advancement", task)
@@ -209,11 +223,18 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Reviewer", reviewer, "")
 			reviewPrompt, _ := e.prompt("reviewer", task)
 			e.emit("Reviewer (" + reviewer + ")")
-			reviewInput := limitText(reviewPrompt+"\nCURRENT DIFF:\n"+diff, e.budget("reviewer").MaxInputChars)
+			reviewInput := e.limitRoleInput("reviewer", reviewPrompt+"\nCURRENT DIFF:\n"+diff)
 			review, err := e.runRole(ctx, "reviewer", reviewInput, turns, metrics)
 			_ = record.Log(ordinal+1, "reviewer", review)
 			if err != nil {
 				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
+				if retryableError(err) && state.Attempt < maxRetries {
+					e.emit(fmt.Sprintf("Retryable reviewer failure; retrying in %ds", e.Config.EffectiveRetryBackoffSeconds()))
+					if err := waitBackoff(ctx, e.Config.EffectiveRetryBackoffSeconds()); err != nil {
+						return err
+					}
+					continue
+				}
 				return err
 			}
 			if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(review), 0644); err != nil {
@@ -226,6 +247,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 			if state.Attempt < maxRetries {
 				e.emit("Reviewer requested changes")
+				_ = writeContextSummary(e.Root, task, metrics)
 				continue
 			}
 
@@ -233,7 +255,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Judge", judge, "")
 			judgePrompt, _ := e.prompt("judge", task)
 			e.emit("Judge (" + judge + ")")
-			judgeInput := limitText(judgePrompt+"\nREVIEW:\n"+review+"\nCURRENT DIFF:\n"+diff, e.budget("judge").MaxInputChars)
+			judgeInput := e.limitRoleInput("judge", judgePrompt+"\nREVIEW:\n"+review+"\nCURRENT DIFF:\n"+diff)
 			verdict, err := e.runRole(ctx, "judge", judgeInput, turns, metrics)
 			_ = record.Log(ordinal+1, "judge", verdict)
 			if err != nil {
@@ -286,7 +308,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			e.emit("✓ final coder turn complete")
 		}
 		if completed {
-			_ = record.UpdateTask(ordinal+1, "completed", "", tokenCountFromFiles(e.Root), gitutil.ChangedFiles(e.Root), state.Attempt, reviewRounds)
+			_ = record.UpdateTask(ordinal+1, "completed", "", taskTokenCount(e.Root, metrics), gitutil.ChangedFiles(e.Root), state.Attempt, reviewRounds)
 			_ = record.UpdateTaskMetrics(ordinal+1, metrics)
 			_ = writeContextSummary(e.Root, task, metrics)
 			_ = os.Remove(promptPath)
@@ -345,14 +367,33 @@ func (e *Engine) prompt(role, task string) (string, error) {
 	if summary == "" {
 		summary = "No previous task summary."
 	}
-	if role != "coder" {
-		contextText = "Use current diff and task evidence; full project context is intentionally omitted to reduce repetition."
+	switch role {
+	case "reviewer":
+		contextText = "Use the current diff, task, tests, summary, and relevant rules. Do not reconstruct the whole project."
+		rules = limitText(rules, 4000)
+	case "judge":
+		contextText = "Resolve only the reviewer disagreement using the task evidence and current diff."
+		rules = limitText(rules, 2500)
 	}
 	prompt := fmt.Sprintf("ROLE:\n%s\nCONTEXT:\n%s\nRULES:\n%s\nTASK:\n%s\nSUMMARY:\n%s\nFEEDBACK:\n%s", rolePrompt, contextText, rules, task, summary, feedback)
-	return limitText(prompt, e.budget(role).MaxInputChars), nil
+	budget := e.budget(role)
+	maxChars := budget.MaxInputChars
+	if budget.MaxInputTokens > 0 && budget.MaxInputTokens*4 < maxChars {
+		maxChars = budget.MaxInputTokens * 4
+	}
+	return limitText(prompt, maxChars), nil
 }
 
 func (e *Engine) budget(role string) config.RoleBudget { return e.Config.Budget(role) }
+
+func (e *Engine) limitRoleInput(role, value string) string {
+	budget := e.budget(role)
+	maxChars := budget.MaxInputChars
+	if budget.MaxInputTokens > 0 && budget.MaxInputTokens*4 < maxChars {
+		maxChars = budget.MaxInputTokens * 4
+	}
+	return limitText(value, maxChars)
+}
 
 func (e *Engine) runRole(ctx context.Context, role, prompt string, turns map[string]int, metrics map[string]history.AgentMetric) (string, error) {
 	budget := e.budget(role)
@@ -364,9 +405,14 @@ func (e *Engine) runRole(ctx context.Context, role, prompt string, turns map[str
 	roleCtx := agent.WithEffort(ctx, budget.Effort)
 	if e.Config.ReuseSessions {
 		roleCtx = agent.WithSession(roleCtx, e.Sessions[role])
+		roleCtx = agent.WithSessionTemplate(roleCtx, e.Config.Commands[e.Config.Agents[role]].SessionArgs)
 	}
 	rawOutput, err := e.runAgent(roleCtx, role, prompt)
-	output := limitOutput(rawOutput, budget.MaxOutputChars)
+	maxOutputChars := budget.MaxOutputChars
+	if budget.MaxOutputTokens > 0 && budget.MaxOutputTokens*4 < maxOutputChars {
+		maxOutputChars = budget.MaxOutputTokens * 4
+	}
+	output := limitOutput(rawOutput, maxOutputChars)
 	if e.Config.ReuseSessions {
 		if session := extractSessionID(output); session != "" {
 			e.Sessions[role] = session
@@ -383,11 +429,14 @@ func (e *Engine) runRole(ctx context.Context, role, prompt string, turns map[str
 		_ = os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(message), 0644)
 		e.emit("✗ " + message)
 	}
-	metrics[key] = history.AgentMetric{Role: role, CLI: e.Config.Agents[role], Model: e.Config.Models[role], Effort: budget.Effort, Turns: turns[role], InputChars: len(prompt), OutputChars: len(rawOutput), Duration: time.Since(started), Status: status}
+	inputTokens, outputTokens := parseTokenMetrics(rawOutput)
+	metrics[key] = history.AgentMetric{Role: role, CLI: e.Config.Agents[role], Model: e.Config.Models[role], Effort: budget.Effort, Turns: turns[role], InputChars: len(prompt), OutputChars: len(rawOutput), InputTokens: inputTokens, OutputTokens: outputTokens, EstimatedTokens: estimateTokens(prompt) + estimateTokens(rawOutput), Duration: time.Since(started), Status: status, Retryable: retryableError(err), Error: errorText(err), SessionID: e.Sessions[role]}
 	return output, err
 }
 
-var sessionIDRE = regexp.MustCompile(`(?i)(?:session[_ -]?id|sessionId)\s*[=:]\s*["']?([a-z0-9-]{16,})`)
+var sessionIDRE = regexp.MustCompile(`(?i)(?:session[_ -]?id|sessionId|thread[_ -]?id|conversation[_ -]?id)\s*[=:]\s*["']?([a-z0-9-]{16,})`)
+
+var tokenMetricRE = regexp.MustCompile(`(?i)(input|prompt|output|completion)?\s*tokens?\s*(?:used|:|=)\s*([0-9,]+)`)
 
 func extractSessionID(output string) string {
 	match := sessionIDRE.FindStringSubmatch(output)
@@ -395,6 +444,70 @@ func extractSessionID(output string) string {
 		return match[1]
 	}
 	return ""
+}
+
+func parseTokenMetrics(output string) (input, outputTokens int) {
+	for _, match := range tokenMetricRE.FindAllStringSubmatch(output, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		n, _ := strconv.Atoi(strings.ReplaceAll(match[2], ",", ""))
+		switch strings.ToLower(match[1]) {
+		case "input", "prompt":
+			input += n
+		case "output", "completion":
+			outputTokens += n
+		default:
+			outputTokens += n
+		}
+	}
+	return input, outputTokens
+}
+
+func estimateTokens(value string) int {
+	if strings.TrimSpace(value) == "" {
+		return 0
+	}
+	return (len(value) + 3) / 4
+}
+
+func retryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return retryableText(err.Error())
+}
+
+func retryableText(value string) bool {
+	lower := strings.ToLower(value)
+	for _, marker := range []string{"429", "rate limit", "rate_limit", "quota", "capacity", "too many requests", "temporarily unavailable", "timeout", "timed out", "connection reset", "resource exhausted", "usage limit", "context window exceeded"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func summarizeAgentError(value string) string {
+	words := strings.Fields(value)
+	if len(words) > 32 {
+		words = words[len(words)-32:]
+	}
+	return limitText(strings.Join(words, " "), 500)
+}
+
+func waitBackoff(ctx context.Context, seconds int) error {
+	if seconds <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(time.Duration(seconds) * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func writeContextSummary(root, task string, metrics map[string]history.AgentMetric) error {
@@ -524,6 +637,9 @@ func (e *Engine) runAgent(ctx context.Context, role, prompt string) (string, err
 	result, err := e.Runner.Run(ctx, e.Root, cli, template, prompt, e.Config.Models[role], logs)
 	close(logs)
 	<-done
+	if err == nil && retryableText(result) {
+		return result, fmt.Errorf("%s agent (%s) reported a retryable quota or capacity failure: %s", role, cli, summarizeAgentError(result))
+	}
 	if err != nil {
 		return result, fmt.Errorf("%s agent (%s) failed: %w", role, cli, err)
 	}
@@ -602,6 +718,21 @@ func tokenCountFromFiles(root string) int {
 		return (characters + 3) / 4
 	}
 	return total
+}
+
+func taskTokenCount(root string, metrics map[string]history.AgentMetric) int {
+	total := 0
+	for _, metric := range metrics {
+		if metric.InputTokens+metric.OutputTokens > 0 {
+			total += metric.InputTokens + metric.OutputTokens
+			continue
+		}
+		total += metric.EstimatedTokens
+	}
+	if total > 0 {
+		return total
+	}
+	return tokenCountFromFiles(root)
 }
 
 func pendingTaskIndexes(lines []string) []int {

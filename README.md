@@ -14,6 +14,9 @@ PAOLA runs agents inside your project, optionally runs deterministic tests, requ
 - Encrypted and compressed manifests, agent logs, and diffs.
 - Interactive history with timelines and file-by-file diffs.
 - Role budgets, bounded context, incremental summaries, effort settings, and optional simulation.
+- Per-role input/output token budgets with UTF-8-safe truncation and fallback estimation.
+- Retryable failure detection with bounded backoff, persisted failure details, and resumable state.
+- Optional per-execution Git worktrees (`--worktree` or `worktree_per_run: true`).
 
 ## Requirements
 
@@ -69,12 +72,13 @@ Headless mode uses the current branch as the base unless one is supplied:
 ```sh
 paola run --headless
 paola run --headless --base-branch main
+paola run --worktree
 
 # Validate the workflow without invoking an agent or changing project files
 paola run --simulate
 ```
 
-Interactive mode asks for the base branch, then creates or checks out a task branch such as `paola/crud-de-usuarios`. The branch is never merged automatically.
+Interactive mode asks for the base branch, then creates or checks out a task branch such as `paola/crud-de-usuarios`. The branch is never merged automatically. With `--worktree`, PAOLA creates the task branch directly from the selected base and runs in a sibling worktree without changing the original checkout.
 
 ## Controls
 
@@ -133,21 +137,31 @@ budgets:
     effort: medium
     max_input_chars: 24000
     max_output_chars: 60000
+    max_input_tokens: 6000
+    max_output_tokens: 15000
   reviewer:
     max_turns: 2
     effort: low
     max_input_chars: 50000
     max_output_chars: 30000
+    max_input_tokens: 12500
+    max_output_tokens: 7500
   judge:
     max_turns: 1
     effort: low
     max_input_chars: 50000
     max_output_chars: 20000
+    max_input_tokens: 12500
+    max_output_tokens: 5000
+retry_backoff_seconds: 3
+worktree_per_run: false
 ```
 
 PAOLA sends only the context relevant to each role and maintains a compact `.paola/state/context_summary.md`. Reviewer and Judge receive the task evidence and diff, not the full project context. History records per-role CLI, model, effort, turns, input/output size, duration, and status.
 
-`reuse_sessions` is opt-in and currently best-effort: when a compatible CLI emits a session identifier, PAOLA can resume it on later turns. If no identifier is emitted, it safely starts a fresh invocation.
+`reuse_sessions` is opt-in and currently best-effort: when a compatible CLI emits a session identifier, PAOLA can resume it on later turns. Claude uses `--resume` by default. Other CLIs can define their own adapter in `commands.<cli>.session_args`, for example `--session {{session_id}}`. If no identifier is emitted, it safely starts a fresh invocation.
+
+When an agent reports a rate limit, quota exhaustion, timeout, or temporary capacity error, PAOLA retries only within `max_retries` and waits `retry_backoff_seconds` between attempts. Other failures stop the roadmap gate and are saved in the encrypted run report. `paola run --simulate` exercises the orchestration flow without invoking agents or changing project files.
 
 ## Git behavior
 

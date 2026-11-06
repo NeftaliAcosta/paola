@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 type AgentRunner interface {
@@ -23,6 +24,7 @@ const defaultIdleTimeout = 30 * time.Minute
 type idleTimeoutContextKey struct{}
 type effortContextKey struct{}
 type sessionContextKey struct{}
+type sessionTemplateContextKey struct{}
 
 // WithIdleTimeout configures the maximum period an agent may remain silent.
 // Output from stdout or stderr resets the timer; active agents are not stopped.
@@ -53,12 +55,29 @@ func WithSession(ctx context.Context, sessionID string) context.Context {
 	return context.WithValue(ctx, sessionContextKey{}, strings.TrimSpace(sessionID))
 }
 
+// WithSessionTemplate lets a CLI adapter define how an existing session is resumed.
+// The template may contain {{session_id}} and is expanded only when a session exists.
+func WithSessionTemplate(ctx context.Context, template string) context.Context {
+	return context.WithValue(ctx, sessionTemplateContextKey{}, strings.TrimSpace(template))
+}
+
 func sessionID(ctx context.Context) string {
 	value, _ := ctx.Value(sessionContextKey{}).(string)
 	return value
 }
 
+func sessionTemplate(ctx context.Context) string {
+	value, _ := ctx.Value(sessionTemplateContextKey{}).(string)
+	return value
+}
+
 func (Runner) Run(ctx context.Context, root, cli, template, prompt, model string, logs chan<- string) (string, error) {
+	// CLIs reject malformed UTF-8 at argument parsing time. Agent output and
+	// diffs can contain bytes copied from legacy files, so sanitize every value
+	// that becomes part of the shell command before invoking the child process.
+	template = normalizeUTF8(template)
+	prompt = normalizeUTF8(prompt)
+	model = normalizeUTF8(model)
 	if _, err := exec.LookPath(cli); err != nil {
 		return "", fmt.Errorf("agent %q not found in PATH", cli)
 	}
@@ -77,8 +96,14 @@ func (Runner) Run(ctx context.Context, root, cli, template, prompt, model string
 		}
 	}
 	sessionArgs := ""
-	if value := sessionID(ctx); value != "" && cli == "claude" {
-		sessionArgs = "--resume " + shellQuote(value)
+	if value := sessionID(ctx); value != "" {
+		template := sessionTemplate(ctx)
+		if template == "" && cli == "claude" {
+			template = "--resume {{session_id}}"
+		}
+		if template != "" {
+			sessionArgs = strings.ReplaceAll(template, "{{session_id}}", shellQuote(value))
+		}
 	}
 	if effortArgs != "" && !strings.Contains(command, "{{effort_args}}") {
 		command = strings.Replace(command, "{{prompt}}", effortArgs+" {{prompt}}", 1)
@@ -174,6 +199,13 @@ func (Runner) Run(ctx context.Context, root, cli, template, prompt, model string
 		return result, fmt.Errorf("agent %q failed without output: %w", cli, err)
 	}
 	return result, err
+}
+
+func normalizeUTF8(value string) string {
+	if utf8.ValidString(value) {
+		return value
+	}
+	return strings.ToValidUTF8(value, "�")
 }
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }

@@ -45,15 +45,21 @@ type TaskRecord struct {
 }
 
 type AgentMetric struct {
-	Role        string        `json:"role"`
-	CLI         string        `json:"cli"`
-	Model       string        `json:"model,omitempty"`
-	Effort      string        `json:"effort,omitempty"`
-	Turns       int           `json:"turns"`
-	InputChars  int           `json:"input_chars"`
-	OutputChars int           `json:"output_chars"`
-	Duration    time.Duration `json:"duration_ns"`
-	Status      string        `json:"status"`
+	Role            string        `json:"role"`
+	CLI             string        `json:"cli"`
+	Model           string        `json:"model,omitempty"`
+	Effort          string        `json:"effort,omitempty"`
+	Turns           int           `json:"turns"`
+	InputChars      int           `json:"input_chars"`
+	OutputChars     int           `json:"output_chars"`
+	InputTokens     int           `json:"input_tokens,omitempty"`
+	OutputTokens    int           `json:"output_tokens,omitempty"`
+	EstimatedTokens int           `json:"estimated_tokens,omitempty"`
+	Duration        time.Duration `json:"duration_ns"`
+	Status          string        `json:"status"`
+	Retryable       bool          `json:"retryable,omitempty"`
+	Error           string        `json:"error,omitempty"`
+	SessionID       string        `json:"session_id,omitempty"`
 }
 type Recorder struct {
 	root     string

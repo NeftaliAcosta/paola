@@ -307,9 +307,9 @@ func RunWithFiles(root string, files FileOptions) error {
 	if c.Budgets == nil {
 		c.Budgets = config.Default(project).Budgets
 	}
-	c.Budgets["coder"] = config.RoleBudget{MaxTurns: c.Budget("coder").MaxTurns, Effort: effortCoder, MaxInputChars: c.Budget("coder").MaxInputChars, MaxOutputChars: c.Budget("coder").MaxOutputChars}
-	c.Budgets["reviewer"] = config.RoleBudget{MaxTurns: c.Budget("reviewer").MaxTurns, Effort: effortReviewer, MaxInputChars: c.Budget("reviewer").MaxInputChars, MaxOutputChars: c.Budget("reviewer").MaxOutputChars}
-	c.Budgets["judge"] = config.RoleBudget{MaxTurns: c.Budget("judge").MaxTurns, Effort: effortJudge, MaxInputChars: c.Budget("judge").MaxInputChars, MaxOutputChars: c.Budget("judge").MaxOutputChars}
+	c.Budgets["coder"] = withEffort(c.Budget("coder"), effortCoder)
+	c.Budgets["reviewer"] = withEffort(c.Budget("reviewer"), effortReviewer)
+	c.Budgets["judge"] = withEffort(c.Budget("judge"), effortJudge)
 
 	if err := config.EnsureDir(root); err != nil {
 		return err
@@ -369,6 +369,11 @@ func RunWithFiles(root string, files FileOptions) error {
 	}
 	fmt.Println("✓ .paola/ initialized; paola run is ready")
 	return nil
+}
+
+func withEffort(b config.RoleBudget, effort string) config.RoleBudget {
+	b.Effort = effort
+	return b
 }
 
 func readFileOption(path, label string) (string, error) {

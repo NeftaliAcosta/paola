@@ -18,7 +18,15 @@ func TestEffectiveDefaultsDoNotMutateLoadedValues(t *testing.T) {
 func TestBudgetFallback(t *testing.T) {
 	c := Config{}
 	got := c.Budget("coder")
-	if got.MaxTurns != 2 || got.Effort != "medium" || got.MaxInputChars != 24000 {
+	if got.MaxTurns != 2 || got.Effort != "medium" || got.MaxInputChars != 24000 || got.MaxInputTokens != 6000 {
 		t.Fatalf("unexpected coder fallback: %+v", got)
+	}
+}
+
+func TestPartialBudgetPreservesConfiguredValuesAndFillsMissingDefaults(t *testing.T) {
+	c := Config{Budgets: map[string]RoleBudget{"coder": {MaxTurns: 1, MaxInputTokens: 1000}}}
+	got := c.Budget("coder")
+	if got.MaxTurns != 1 || got.MaxInputTokens != 1000 || got.MaxOutputTokens != 15000 || got.Effort != "medium" {
+		t.Fatalf("unexpected merged budget: %+v", got)
 	}
 }

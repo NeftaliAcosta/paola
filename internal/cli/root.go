@@ -27,6 +27,7 @@ const version = "0.1.10"
 
 var (
 	headless      bool
+	worktree      bool
 	baseBranch    string
 	simulate      bool
 	contextFile   string
@@ -83,6 +84,7 @@ func init() {
 	rootCmd.AddCommand(initCmd)
 	run := &cobra.Command{Use: "run", Short: "Run the autonomous roadmap", RunE: runCommand}
 	run.Flags().BoolVar(&headless, "headless", false, "disable the live terminal UI")
+	run.Flags().BoolVar(&worktree, "worktree", false, "run in an isolated Git worktree")
 	run.Flags().StringVar(&baseBranch, "base-branch", "", "base branch for the isolated task branch")
 	run.Flags().BoolVar(&simulate, "simulate", false, "exercise workflow without invoking agents or modifying project files")
 	rootCmd.AddCommand(run)
@@ -153,20 +155,30 @@ func runCommand(*cobra.Command, []string) error {
 			return branchErr
 		}
 		branch = gitutil.BranchInfo{Base: current, Task: current}
+	} else if worktree || c.WorktreePerRun {
+		base, branchErr := selectBaseBranch(r, c, headless, baseBranch)
+		if branchErr != nil {
+			return branchErr
+		}
+		branch = gitutil.BranchInfo{Base: base}
 	} else {
 		branch, err = prepareRunBranch(r, c, headless, baseBranch)
 		if err != nil {
 			return err
 		}
 	}
+	executionRoot, branch, err := executionRootForRun(r, c, branch, !simulate && (worktree || c.WorktreePerRun))
+	if err != nil {
+		return err
+	}
 	if headless {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer cancel()
-		e := &orchestrator.Engine{Root: r, Config: c, Runner: agent.Runner{}, Control: orchestrator.NewControl(cancel), TaskBranch: branch.Task, BaseBranch: branch.Base, Log: func(s string) { fmt.Println(s) }}
+		e := &orchestrator.Engine{Root: executionRoot, Config: c, Runner: agent.Runner{}, Control: orchestrator.NewControl(cancel), TaskBranch: branch.Task, BaseBranch: branch.Base, Log: func(s string) { fmt.Println(s) }}
 		return e.Run(ctx)
 	}
 	for {
-		err = runInteractive(r, c, branch)
+		err = runInteractive(executionRoot, c, branch)
 		action, menuErr := postRunMenu(r, err)
 		if menuErr != nil {
 			return menuErr
@@ -182,7 +194,19 @@ func runCommand(*cobra.Command, []string) error {
 			if err != nil {
 				return err
 			}
-			branch, err = prepareRunBranch(r, c, false, "")
+			if worktree || c.WorktreePerRun {
+				base, baseErr := selectBaseBranch(r, c, false, "")
+				if baseErr != nil {
+					return baseErr
+				}
+				branch = gitutil.BranchInfo{Base: base}
+			} else {
+				branch, err = prepareRunBranch(r, c, false, "")
+				if err != nil {
+					return err
+				}
+			}
+			executionRoot, branch, err = executionRootForRun(r, c, branch, worktree || c.WorktreePerRun)
 			if err != nil {
 				return err
 			}
@@ -205,6 +229,53 @@ func runCommand(*cobra.Command, []string) error {
 			return nil
 		}
 	}
+}
+
+func executionRootForRun(root string, c config.Config, branch gitutil.BranchInfo, isolate bool) (string, gitutil.BranchInfo, error) {
+	if !isolate {
+		return root, branch, nil
+	}
+	isolated, taskBranch, err := gitutil.CreateExecutionWorktree(root, c.TaskTitle, branch.Base)
+	if err != nil {
+		return "", gitutil.BranchInfo{}, err
+	}
+	branch.Task = taskBranch
+	fmt.Printf("PAOLA execution worktree: %s\n", isolated)
+	return isolated, branch, nil
+}
+
+// selectBaseBranch only reads Git state. It never checks out the caller's
+// repository, which is essential when the execution will use a worktree.
+func selectBaseBranch(root string, c config.Config, headlessMode bool, requestedBase string) (string, error) {
+	current, err := gitutil.CurrentBranch(root)
+	if err != nil {
+		return "", err
+	}
+	branches, err := gitutil.Branches(root)
+	if err != nil {
+		return "", err
+	}
+	base := requestedBase
+	if base == "" {
+		base = current
+	}
+	if !containsString(branches, base) {
+		return "", fmt.Errorf("base branch %q does not exist locally", base)
+	}
+	if headlessMode || requestedBase != "" {
+		return base, nil
+	}
+	options := make([]huh.Option[string], 0, len(branches))
+	for _, name := range branches {
+		options = append(options, huh.NewOption(name, name))
+	}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().Title("Select base branch to branch off from:").Options(options...).Value(&base),
+	).Title("Git isolation").Description("PAOLA will create a separate worktree without changing this checkout."))
+	if err := form.Run(); err != nil {
+		return "", err
+	}
+	return base, nil
 }
 
 func prepareRunBranch(root string, c config.Config, headlessMode bool, requestedBase string) (gitutil.BranchInfo, error) {
@@ -636,7 +707,15 @@ func renderHistoryReport(run paolahistory.Manifest) string {
 					if !ok {
 						continue
 					}
-					fmt.Fprintf(&b, "       %-10s %-8s · model: %s · effort: %s · turn %d · in %d · out %d · %s · %s\n", key, metric.CLI, empty(metric.Model), empty(metric.Effort), metric.Turns, metric.InputChars, metric.OutputChars, formatDuration(metric.Duration), strings.ToUpper(metric.Status))
+					tokens := metric.InputTokens + metric.OutputTokens
+					tokenLabel := fmt.Sprintf("%d tokens", tokens)
+					if tokens == 0 {
+						tokenLabel = fmt.Sprintf("~%d tokens", metric.EstimatedTokens)
+					}
+					fmt.Fprintf(&b, "       %-10s %-8s · model: %s · effort: %s · turn %d · %s · %d/%d chars · %s · %s\n", key, metric.CLI, empty(metric.Model), empty(metric.Effort), metric.Turns, tokenLabel, metric.InputChars, metric.OutputChars, formatDuration(metric.Duration), strings.ToUpper(metric.Status))
+					if metric.Error != "" {
+						fmt.Fprintf(&b, "       error: %s\n", metric.Error)
+					}
 				}
 			}
 		}
@@ -663,7 +742,7 @@ func renderHistoryReport(run paolahistory.Manifest) string {
 		model := empty(run.Config.Models[role])
 		budget := run.Config.Budget(role)
 		fmt.Fprintf(&b, "%-10s %s · model: %s · effort: %s · max turns: %d\n", roleLabel(role), cli, model, empty(budget.Effort), budget.MaxTurns)
-		fmt.Fprintf(&b, "%-10s input: %d chars · output: %d chars\n", "", budget.MaxInputChars, budget.MaxOutputChars)
+		fmt.Fprintf(&b, "%-10s input: %d chars/~%d tokens · output: %d chars/~%d tokens\n", "", budget.MaxInputChars, budget.MaxInputTokens, budget.MaxOutputChars, budget.MaxOutputTokens)
 	}
 
 	return b.String()

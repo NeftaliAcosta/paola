@@ -4,12 +4,40 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/neftaliacosta/paola/internal/history"
 )
 
 func TestExtractSessionID(t *testing.T) {
 	got := extractSessionID(`session_id: "0123456789abcdef-1234"`)
 	if got != "0123456789abcdef-1234" {
 		t.Fatalf("session id = %q", got)
+	}
+}
+
+func TestParseTokenMetrics(t *testing.T) {
+	in, out := parseTokenMetrics("input tokens: 1,200\noutput tokens used 345\n")
+	if in != 1200 || out != 345 {
+		t.Fatalf("token metrics = %d/%d, want 1200/345", in, out)
+	}
+}
+
+func TestTaskTokenCountPrefersAgentMetrics(t *testing.T) {
+	got := taskTokenCount(t.TempDir(), map[string]history.AgentMetric{
+		"coder":    {InputTokens: 100, OutputTokens: 40, EstimatedTokens: 999},
+		"reviewer": {EstimatedTokens: 20},
+	})
+	if got != 160 {
+		t.Fatalf("task token count = %d, want 160", got)
+	}
+}
+
+func TestRetryableTextDetectsQuotaOutput(t *testing.T) {
+	if !retryableText("Error: resource exhausted; retry after reset") {
+		t.Fatal("quota output was not classified as retryable")
+	}
+	if retryableText("all tests passed") {
+		t.Fatal("normal output was classified as retryable")
 	}
 }
 

@@ -15,16 +15,19 @@ import (
 const Dir = ".paola"
 
 type AgentCommand struct {
-	Coder    string `yaml:"coder"`
-	Reviewer string `yaml:"reviewer"`
-	Judge    string `yaml:"judge"`
+	Coder       string `yaml:"coder"`
+	Reviewer    string `yaml:"reviewer"`
+	Judge       string `yaml:"judge"`
+	SessionArgs string `yaml:"session_args,omitempty"`
 }
 
 type RoleBudget struct {
-	MaxTurns       int    `yaml:"max_turns,omitempty"`
-	Effort         string `yaml:"effort,omitempty"`
-	MaxInputChars  int    `yaml:"max_input_chars,omitempty"`
-	MaxOutputChars int    `yaml:"max_output_chars,omitempty"`
+	MaxTurns        int    `yaml:"max_turns,omitempty"`
+	Effort          string `yaml:"effort,omitempty"`
+	MaxInputChars   int    `yaml:"max_input_chars,omitempty"`
+	MaxOutputChars  int    `yaml:"max_output_chars,omitempty"`
+	MaxInputTokens  int    `yaml:"max_input_tokens,omitempty"`
+	MaxOutputTokens int    `yaml:"max_output_tokens,omitempty"`
 }
 
 type Config struct {
@@ -35,6 +38,8 @@ type Config struct {
 	AgentIdleTimeoutMinutes int                     `yaml:"agent_idle_timeout_minutes,omitempty"`
 	Simulation              bool                    `yaml:"simulation,omitempty"`
 	ReuseSessions           bool                    `yaml:"reuse_sessions,omitempty"`
+	WorktreePerRun          bool                    `yaml:"worktree_per_run,omitempty"`
+	RetryBackoffSeconds     int                     `yaml:"retry_backoff_seconds,omitempty"`
 	Budgets                 map[string]RoleBudget   `yaml:"budgets,omitempty"`
 	Agents                  map[string]string       `yaml:"agents"`
 	Models                  map[string]string       `yaml:"models"`
@@ -52,23 +57,43 @@ func Default(project string) Config {
 	return Config{ProjectName: project, TaskTitle: "", MaxRetries: 1, AgentIdleTimeoutMinutes: 30, Budgets: defaultBudgets(), Agents: map[string]string{"coder": "codex", "reviewer": "codex", "judge": "agy"}, Models: map[string]string{"coder": "", "reviewer": "", "judge": ""}, Commands: map[string]AgentCommand{
 		"agy":    {Coder: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Reviewer: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Judge: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`},
 		"codex":  {Coder: `codex exec --full-auto {{model_args}} {{effort_args}} {{prompt}}`, Reviewer: `codex exec {{model_args}} {{effort_args}} {{prompt}}`, Judge: `codex exec {{model_args}} {{effort_args}} {{prompt}}`},
-		"claude": {Coder: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} -p {{prompt}}`, Reviewer: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} -p {{prompt}}`, Judge: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} -p {{prompt}}`},
+		"claude": {Coder: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} {{session_args}} -p {{prompt}}`, Reviewer: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} {{session_args}} -p {{prompt}}`, Judge: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} {{session_args}} -p {{prompt}}`, SessionArgs: `--resume {{session_id}}`},
 	}}
 }
 
 func defaultBudgets() map[string]RoleBudget {
 	return map[string]RoleBudget{
-		"coder":    {MaxTurns: 2, Effort: "medium", MaxInputChars: 24000, MaxOutputChars: 60000},
-		"reviewer": {MaxTurns: 2, Effort: "low", MaxInputChars: 50000, MaxOutputChars: 30000},
-		"judge":    {MaxTurns: 1, Effort: "low", MaxInputChars: 50000, MaxOutputChars: 20000},
+		"coder":    {MaxTurns: 2, Effort: "medium", MaxInputChars: 24000, MaxOutputChars: 60000, MaxInputTokens: 6000, MaxOutputTokens: 15000},
+		"reviewer": {MaxTurns: 2, Effort: "low", MaxInputChars: 50000, MaxOutputChars: 30000, MaxInputTokens: 12500, MaxOutputTokens: 7500},
+		"judge":    {MaxTurns: 1, Effort: "low", MaxInputChars: 50000, MaxOutputChars: 20000, MaxInputTokens: 12500, MaxOutputTokens: 5000},
 	}
 }
 
 func (c Config) Budget(role string) RoleBudget {
-	if budget, ok := c.Budgets[role]; ok {
-		return budget
+	defaults := defaultBudgets()[role]
+	budget, ok := c.Budgets[role]
+	if !ok {
+		return defaults
 	}
-	return defaultBudgets()[role]
+	if budget.MaxTurns <= 0 {
+		budget.MaxTurns = defaults.MaxTurns
+	}
+	if budget.Effort == "" {
+		budget.Effort = defaults.Effort
+	}
+	if budget.MaxInputChars <= 0 {
+		budget.MaxInputChars = defaults.MaxInputChars
+	}
+	if budget.MaxOutputChars <= 0 {
+		budget.MaxOutputChars = defaults.MaxOutputChars
+	}
+	if budget.MaxInputTokens <= 0 {
+		budget.MaxInputTokens = defaults.MaxInputTokens
+	}
+	if budget.MaxOutputTokens <= 0 {
+		budget.MaxOutputTokens = defaults.MaxOutputTokens
+	}
+	return budget
 }
 
 func (c Config) EffectiveMaxRetries() int {
@@ -83,6 +108,13 @@ func (c Config) EffectiveIdleTimeoutMinutes() int {
 		return c.AgentIdleTimeoutMinutes
 	}
 	return 30
+}
+
+func (c Config) EffectiveRetryBackoffSeconds() int {
+	if c.RetryBackoffSeconds > 0 {
+		return c.RetryBackoffSeconds
+	}
+	return 3
 }
 
 func Load(root string) (Config, error) {

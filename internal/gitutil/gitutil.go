@@ -6,12 +6,43 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 )
 
 type BranchInfo struct {
 	Base string
 	Task string
+}
+
+// CreateExecutionWorktree creates an isolated branch and worktree without
+// touching the caller's checkout. The caller owns the returned directory.
+func CreateExecutionWorktree(root, title, baseBranch string) (string, string, error) {
+	// Nanoseconds avoid collisions when a user starts two isolated runs within
+	// the same second.
+	id := time.Now().UTC().Format("20060102T150405.000000000Z")
+	branch := "paola/run-" + slug(title) + "-" + strings.ToLower(id)
+	if strings.HasSuffix(branch, "-") {
+		branch += "run"
+	}
+	baseDir := filepath.Join(filepath.Dir(root), filepath.Base(root)+".paola-worktrees")
+	path := filepath.Join(baseDir, id)
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(baseBranch) == "" {
+		baseBranch = "HEAD"
+	}
+	if output, err := run(root, "worktree", "add", "-b", branch, path, baseBranch); err != nil {
+		return "", "", fmt.Errorf("create execution worktree: %s", strings.TrimSpace(string(output)))
+	}
+	// Workspace metadata remains in the original project and is shared through
+	// a symlink. Git ignores .paola, while history and encryption stay unified.
+	if err := os.Symlink(filepath.Join(root, ".paola"), filepath.Join(path, ".paola")); err != nil {
+		_, _ = run(root, "worktree", "remove", "--force", path)
+		return "", "", fmt.Errorf("link PAOLA workspace into worktree: %w", err)
+	}
+	return path, branch, nil
 }
 
 func run(root string, args ...string) ([]byte, error) {
