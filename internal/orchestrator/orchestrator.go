@@ -411,7 +411,8 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(verdict), 0644); err != nil {
 				return err
 			}
-			if hasMarker(verdict, "VERDICT: OVERRIDE_APPROVE") {
+			judgeDecision := normalizeJudgeVerdict(verdict)
+			if judgeDecision == "VERDICT: OVERRIDE_APPROVE" {
 				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "judge", Agent: judge, Type: "judge_decision", Status: "approved", Decision: "VERDICT: OVERRIDE_APPROVE"}); err != nil {
 					return err
 				}
@@ -419,7 +420,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				e.emit("✓ judge approved")
 				break
 			}
-			if !hasMarker(verdict, "VERDICT: FINAL_INSTRUCTIONS") {
+			if judgeDecision != "VERDICT: FINAL_INSTRUCTIONS" {
 				return fmt.Errorf("judge returned no recognized verdict for task %q", task)
 			}
 			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "judge", Agent: judge, Type: "judge_decision", Status: "final_instructions", Decision: "VERDICT: FINAL_INSTRUCTIONS"}); err != nil {
@@ -557,7 +558,29 @@ func (e *Engine) prompt(role, task, taskKey string) (string, error) {
 	if budget.MaxInputTokens > 0 && budget.MaxInputTokens*4 < maxChars {
 		maxChars = budget.MaxInputTokens * 4
 	}
-	return limitText(prompt, maxChars), nil
+	protocol := roleProtocol(role)
+	if protocol == "" {
+		return limitText(prompt, maxChars), nil
+	}
+	// Keep the machine-readable contract at the end of the prompt. A plain
+	// prefix truncation must never remove the only instruction that controls
+	// orchestration state transitions.
+	if maxChars > 0 && len(protocol) < maxChars {
+		bodyLimit := maxChars - len(protocol)
+		return limitText(prompt, bodyLimit) + protocol, nil
+	}
+	return protocol, nil
+}
+
+func roleProtocol(role string) string {
+	switch role {
+	case "reviewer":
+		return "\n\nPAOLA PROTOCOL (machine-readable, mandatory):\nYour final non-empty line MUST be exactly one of:\nSTATUS: LGTM\nSTATUS: CHANGES_REQUESTED\nDo not replace it with APPROVED, PASS, or prose.\n"
+	case "judge":
+		return "\n\nPAOLA PROTOCOL (machine-readable, mandatory):\nYour final non-empty line MUST be exactly one of:\nVERDICT: OVERRIDE_APPROVE\nVERDICT: FINAL_INSTRUCTIONS\nDo not replace it with APPROVE, PASS, PILOT_BLOCKED, or prose.\n"
+	default:
+		return ""
+	}
 }
 
 func (e *Engine) budget(role string) config.RoleBudget { return e.Config.Budget(role) }
@@ -723,6 +746,25 @@ func isSessionResumeFailure(err error) bool {
 var sessionIDRE = regexp.MustCompile(`(?i)(?:session[_ -]?id|sessionId|thread[_ -]?id|conversation[_ -]?id)\s*[=:]\s*["']?([a-z0-9-]{16,})`)
 
 var tokenMetricRE = regexp.MustCompile(`(?i)(input|prompt|output|completion)?\s*tokens?\s*(?:used|:|=)\s*([0-9,]+)`)
+
+var judgeVerdictRE = regexp.MustCompile(`(?i)^judge\s+verdict:\s*\**(pass|approved)\**\.?$`)
+
+var explicitJudgeDecisionRE = regexp.MustCompile(`(?i)^(?:judge\s+verdict|ruling|decision|judgment|judgement|final\s+verdict|verdict):\s*\**(approved|approve|pass|override[_ -]?approve|final[_ -]?instructions)\**\.?$`)
+
+var judgeApprovalStatementRE = regexp.MustCompile(`(?i)^(?:action|ruling|decision|verdict):\s*\**(accepted|accept|approved|approve|pass)\**(?:\s|[.,:]).*$`)
+
+var judgeApprovalSummaryRE = regexp.MustCompile(`(?i)^(?:action|ruling|decision|judgment|judgement|final\s+verdict|verdict):\s*\**.*\b(accepted|approved|completed|complete|pass)\b.*$`)
+
+var judgeApprovalBulletRE = regexp.MustCompile(`(?i)^[-*]\s*(accepted|accept|approved|approve|pass)\b.*$`)
+
+var judgeNoDisagreementRE = regexp.MustCompile(`(?i)^(?:judge\s+resolution|disagreement\s+check|disagreement\s+resolution):.*\b(?:no\s+disagreement|none|no\s+substantive\s+disagreement)\b.*$`)
+
+// Some judges summarize an accepted review in prose instead of emitting the
+// adapter marker. Require both an explicit reviewer approval and a concrete
+// handoff to the next task before treating that prose as an approval.
+var judgeReviewerHandoffRE = regexp.MustCompile(`(?is)reviewer\b[^.\n]{0,120}\b(?:approved|approve)\b.*\b(?:ready\s+for|proceed\s+to)\s+task\b`)
+
+var judgeCanonicalRE = regexp.MustCompile("(?i)verdict\\s*:\\s*[#>*_` -]*(override[_ -]?approve|final[_ -]?instructions)")
 
 func extractSessionID(output string) string {
 	match := sessionIDRE.FindStringSubmatch(output)
@@ -1024,6 +1066,82 @@ func hasMarker(output, marker string) bool {
 		}
 	}
 	return strings.Contains(output, marker)
+}
+
+// normalizeJudgeVerdict preserves the strict protocol while accepting one
+// explicit, human-readable form emitted by some CLI adapters. Plain
+// "APPROVE" or "PASS" remains invalid because it is too ambiguous to drive
+// orchestration safely.
+func normalizeJudgeVerdict(output string) string {
+	if match := judgeCanonicalRE.FindStringSubmatch(output); len(match) == 2 {
+		decision := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(match[1], "_", "-"), " ", "-"))
+		if decision == "final-instructions" {
+			return "VERDICT: FINAL_INSTRUCTIONS"
+		}
+		return "VERDICT: OVERRIDE_APPROVE"
+	}
+	if hasMarker(output, "VERDICT: OVERRIDE_APPROVE") {
+		return "VERDICT: OVERRIDE_APPROVE"
+	}
+	if hasMarker(output, "VERDICT: FINAL_INSTRUCTIONS") {
+		return "VERDICT: FINAL_INSTRUCTIONS"
+	}
+	if judgeReviewerHandoffRE.MatchString(output) {
+		return "VERDICT: OVERRIDE_APPROVE"
+	}
+	pendingAction := false
+	noDisagreement := false
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(rawLine), "# "))
+		// Some adapters wrap the complete labeled decision in Markdown
+		// emphasis, for example **Verdict: approved.**. Remove only outer
+		// decoration; the explicit label remains mandatory.
+		line = strings.TrimSpace(strings.Trim(line, "*_ "))
+		line = strings.Replace(line, ":**", ":", 1)
+		line = strings.Replace(line, ":__", ":", 1)
+		if judgeNoDisagreementRE.MatchString(line) {
+			noDisagreement = true
+		}
+		if noDisagreement && strings.Contains(strings.ToLower(line), "task") &&
+			(strings.Contains(strings.ToLower(line), "complete") || strings.Contains(strings.ToLower(line), "approved")) {
+			return "VERDICT: OVERRIDE_APPROVE"
+		}
+		if pendingAction && judgeApprovalBulletRE.MatchString(line) {
+			return "VERDICT: OVERRIDE_APPROVE"
+		}
+		pendingAction = strings.EqualFold(strings.TrimSpace(line), "action:")
+		switch strings.ToUpper(line) {
+		case "JUDGE VERDICT: APPROVED":
+			return "VERDICT: OVERRIDE_APPROVE"
+		case "JUDGE VERDICT: FINAL_INSTRUCTIONS", "JUDGE VERDICT: FINAL INSTRUCTIONS":
+			return "VERDICT: FINAL_INSTRUCTIONS"
+		}
+		if match := judgeVerdictRE.FindStringSubmatch(line); len(match) == 2 {
+			return "VERDICT: OVERRIDE_APPROVE"
+		}
+		if match := explicitJudgeDecisionRE.FindStringSubmatch(line); len(match) == 2 {
+			decision := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(match[1], "_", "-"), " ", "-"))
+			if decision == "final-instructions" {
+				return "VERDICT: FINAL_INSTRUCTIONS"
+			}
+			return "VERDICT: OVERRIDE_APPROVE"
+		}
+		if judgeApprovalStatementRE.MatchString(line) {
+			return "VERDICT: OVERRIDE_APPROVE"
+		}
+		if judgeApprovalSummaryRE.MatchString(line) {
+			lower := strings.ToLower(line)
+			if !strings.Contains(lower, "not approved") &&
+				!strings.Contains(lower, "not accepted") &&
+				!strings.Contains(lower, "rejected") &&
+				!strings.Contains(lower, "blocked") &&
+				!strings.Contains(lower, "changes requested") &&
+				!strings.Contains(lower, "failed") {
+				return "VERDICT: OVERRIDE_APPROVE"
+			}
+		}
+	}
+	return ""
 }
 
 func tokenCountFromFiles(root string) int {

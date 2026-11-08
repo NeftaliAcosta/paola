@@ -52,6 +52,63 @@ func TestRetryableTextIgnoresSuccessfulReportMentioningCapacity(t *testing.T) {
 	}
 }
 
+func TestNormalizeJudgeVerdictAcceptsExplicitAdapterApproval(t *testing.T) {
+	if got := normalizeJudgeVerdict("```\n**VERDICT:** `OVERRIDE-APPROVE`\n```"); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized decorated canonical approval = %q", got)
+	}
+	if got := normalizeJudgeVerdict("# Judge Verdict: APPROVED\n\nEvidence verified."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized approval = %q", got)
+	}
+	if got := normalizeJudgeVerdict("Judge verdict: **PASS**.\nDisagreement resolved."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized markdown approval = %q", got)
+	}
+	if got := normalizeJudgeVerdict("### Ruling: APPROVED\n\nNo disagreement found."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized markdown ruling = %q", got)
+	}
+	if got := normalizeJudgeVerdict("**Verdict: approved.**\n\nNo reviewer disagreement found."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized emphasized verdict = %q", got)
+	}
+	if got := normalizeJudgeVerdict("Review disagreement resolved: **no substantive disagreement exists**.\n\nDecision: ACCEPT report as staged."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized acceptance decision = %q", got)
+	}
+	if got := normalizeJudgeVerdict("**JUDGMENT: APPROVED**\n\nReview disagreement resolved."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized judgment approval = %q", got)
+	}
+	if got := normalizeJudgeVerdict("**Verdict:** Task P28-PILOT-V2-02 approved and complete."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized approval summary = %q", got)
+	}
+	if got := normalizeJudgeVerdict("**Action:**\n- Accept `reports/FINAL_REPORT.md` as written without modifications."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized action acceptance = %q", got)
+	}
+	if got := normalizeJudgeVerdict("Judge resolution: **No disagreement**.\n\nTask P28-PILOT-V2-04 complete. Proceed to Task 05."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized no-disagreement completion = %q", got)
+	}
+	if got := normalizeJudgeVerdict("Reviewer verdict `APPROVE` upheld.\n\nVerdict unchanged: **PILOT_BLOCKED** (mandatory criteria remain blocked).\n\nReady for Task 05 packaging."); got != "VERDICT: OVERRIDE_APPROVE" {
+		t.Fatalf("normalized reviewer handoff approval = %q", got)
+	}
+	if got := normalizeJudgeVerdict("Verdict: not approved; blocked by missing evidence."); got != "" {
+		t.Fatalf("negative approval summary = %q, want empty", got)
+	}
+	if got := normalizeJudgeVerdict("Final verdict: **FINAL_INSTRUCTIONS**."); got != "VERDICT: FINAL_INSTRUCTIONS" {
+		t.Fatalf("normalized final instructions = %q", got)
+	}
+	if got := normalizeJudgeVerdict("APPROVE"); got != "" {
+		t.Fatalf("ambiguous approval = %q, want empty", got)
+	}
+	if got := normalizeJudgeVerdict("PASS"); got != "" {
+		t.Fatalf("ambiguous pass = %q, want empty", got)
+	}
+}
+
+func TestRoleProtocolRemainsAtPromptTail(t *testing.T) {
+	if !strings.HasSuffix(roleProtocol("judge"), "Do not replace it with APPROVE, PASS, PILOT_BLOCKED, or prose.\n") {
+		t.Fatal("judge protocol must end with an explicit machine-readable contract")
+	}
+	if roleProtocol("coder") != "" {
+		t.Fatal("coder should not receive a decision protocol")
+	}
+}
+
 func TestLimitOutputPreservesTail(t *testing.T) {
 	input := strings.Repeat("x", 200) + "TAIL"
 	got := limitOutput(input, 100)
