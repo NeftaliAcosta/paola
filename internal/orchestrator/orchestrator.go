@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -171,22 +172,30 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 	_ = os.Remove(promptPath)
 	defer func() { _ = os.Remove(promptPath) }()
 	defer func() {
+		var finalizeErr error
 		state.Sessions = e.Sessions
-		_ = config.SaveState(e.Root, state)
+		finalizeErr = errors.Join(finalizeErr, config.SaveState(e.Root, state))
 		if runErr != nil && ctx.Err() != nil {
 			runStatus = "interrupted"
 			state.Status = "interrupted"
-			_ = config.SaveState(e.Root, state)
+			finalizeErr = errors.Join(finalizeErr, config.SaveState(e.Root, state))
 		}
 		if runErr != nil && activeTaskIndex > 0 && !activeTaskFinished {
-			_ = record.Event(history.Event{TaskIndex: activeTaskIndex, Task: activeTask, Type: "task_finished", Status: "failed", Error: summarizeAgentError(errorText(runErr))})
+			finalizeErr = errors.Join(finalizeErr, record.Event(history.Event{TaskIndex: activeTaskIndex, Task: activeTask, Type: "task_finished", Status: "failed", Error: summarizeAgentError(errorText(runErr))}))
 		}
 		status := runStatus
 		if runErr != nil && status == "failed" && ctx.Err() != nil {
 			status = "interrupted"
 		}
-		_ = record.Event(history.Event{Type: "execution_finished", Status: status, Error: auditError(runErr)})
-		_ = record.FinishWithError(status, errorText(runErr))
+		finalizeErr = errors.Join(finalizeErr, record.Event(history.Event{Type: "execution_finished", Status: status, Error: auditError(runErr)}))
+		finalizeErr = errors.Join(finalizeErr, record.FinishWithError(status, errorText(runErr)))
+		if finalizeErr != nil {
+			if runErr == nil {
+				runErr = fmt.Errorf("history finalization failed: %w", finalizeErr)
+			} else {
+				runErr = errors.Join(runErr, finalizeErr)
+			}
+		}
 	}()
 	if state.Status == "" {
 		state.Status = "running"
@@ -241,7 +250,9 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 			coder := e.Config.Agents["coder"]
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Coder", coder, "")
-			_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "coder", Status: "running", NextAction: "coder turn", SessionKeys: e.taskSessions(taskKey)})
+			if err := e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "coder", Status: "running", NextAction: "coder turn", SessionKeys: e.taskSessions(taskKey)}); err != nil {
+				return err
+			}
 			prompt, _ := e.prompt("coder", task, taskKey)
 			_ = os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "current_prompt.md"), []byte(prompt), 0600)
 			e.emit(fmt.Sprintf("Coder attempt %d/%d (%s)", state.Attempt, maxRetries, coder))
@@ -249,8 +260,12 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return err
 			}
 			coderOutput, err := e.runRole(ctx, "coder", prompt, taskKey, turns, metrics)
-			_ = e.saveSessionState()
-			_ = record.LogAttempt(ordinal+1, state.Attempt, "coder", coderOutput)
+			if saveErr := e.saveSessionState(); saveErr != nil {
+				return fmt.Errorf("persist session state: %w", saveErr)
+			}
+			if logErr := record.LogAttempt(ordinal+1, state.Attempt, "coder", coderOutput); logErr != nil {
+				return fmt.Errorf("persist coder transcript: %w", logErr)
+			}
 			coderStatus := "completed"
 			if err != nil {
 				coderStatus = "failed"
@@ -259,7 +274,9 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return eventErr
 			}
 			if err != nil {
-				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
+				if metricErr := record.UpdateTaskMetrics(ordinal+1, metrics); metricErr != nil {
+					return metricErr
+				}
 				if retryableError(err) && state.Attempt < maxRetries {
 					if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "coder", Agent: coder, Type: "retry_scheduled", Status: "retrying", Error: auditError(err)}); eventErr != nil {
 						return eventErr
@@ -274,20 +291,29 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 
 			if e.Config.TestCommand != "" {
-				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_started", Status: "running", Evidence: []string{"state/test_output.log"}}); err != nil {
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_started", Status: "running", Evidence: []string{fmt.Sprintf("evidence/tasks/%03d/attempt-%02d-tests.enc", ordinal+1, state.Attempt)}}); err != nil {
 					return err
 				}
-				_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "running", NextAction: "validation", SessionKeys: e.taskSessions(taskKey)})
-				testOut, testErr := runTest(ctx, e.Root, e.Config.TestCommand)
+				if err := e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "running", NextAction: "validation", SessionKeys: e.taskSessions(taskKey)}); err != nil {
+					return err
+				}
+				testResult := runTestDetailed(ctx, e.Root, e.Config.TestCommand)
+				testOut, testErr := testResult.Output, testResult.Err
 				if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "test_output.log"), []byte(testOut), 0644); err != nil {
 					return err
 				}
+				testRef, evidenceErr := record.LogTestEvidence(ordinal+1, state.Attempt, history.TestEvidence{Command: e.Config.TestCommand, Workdir: e.Root, StartedAt: testResult.StartedAt, FinishedAt: testResult.FinishedAt, Duration: testResult.FinishedAt.Sub(testResult.StartedAt), ExitCode: testResult.ExitCode, Status: statusFromError(testErr), Output: testOut})
+				if evidenceErr != nil {
+					return fmt.Errorf("persist test evidence: %w", evidenceErr)
+				}
 				if testErr != nil {
-					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_finished", Status: "failed", Error: auditError(testErr), Evidence: []string{"state/test_output.log"}}); err != nil {
+					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_finished", Status: "failed", Error: auditError(testErr), Evidence: []string{testRef}}); err != nil {
 						return err
 					}
 					testStatus = "failed"
-					_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "failed", TestStatus: testStatus, NextAction: "coder correction", SessionKeys: e.taskSessions(taskKey)})
+					if err := e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "failed", TestStatus: testStatus, NextAction: "coder correction", SessionKeys: e.taskSessions(taskKey)}); err != nil {
+						return err
+					}
 					if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(testOut), 0644); err != nil {
 						return err
 					}
@@ -295,17 +321,21 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "retry_scheduled", Status: "retrying", Error: auditError(testErr), Evidence: []string{"state/test_output.log"}}); err != nil {
 						return err
 					}
-					_ = writeContextSummary(e.Root, task, metrics)
+					if summaryErr := writeContextSummary(e.Root, task, metrics); summaryErr != nil {
+						return summaryErr
+					}
 					if state.Attempt >= maxRetries {
 						return fmt.Errorf("tests failed after %d attempts", state.Attempt)
 					}
 					continue
 				}
 				testStatus = "passed"
-				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_finished", Status: "passed", Evidence: []string{"state/test_output.log"}}); err != nil {
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_finished", Status: "passed", Evidence: []string{testRef}}); err != nil {
 					return err
 				}
-				_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "completed", TestStatus: testStatus, NextAction: "review diff", SessionKeys: e.taskSessions(taskKey)})
+				if err := e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "completed", TestStatus: testStatus, NextAction: "review diff", SessionKeys: e.taskSessions(taskKey)}); err != nil {
+					return err
+				}
 			}
 
 			diff := ""
@@ -324,20 +354,28 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			if err := os.WriteFile(gitutil.SafeDiffPath(e.Root), []byte(diff), 0644); err != nil {
 				return err
 			}
-			_ = record.Diff(ordinal+1, diff)
+			if err := record.DiffAttempt(ordinal+1, state.Attempt, diff); err != nil {
+				return fmt.Errorf("persist task %d attempt %d diff: %w", ordinal+1, state.Attempt, err)
+			}
 			reviewer := e.Config.Agents["reviewer"]
 			reviewRounds++
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Reviewer", reviewer, "")
-			_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "reviewer", Status: "running", TestStatus: testStatus, NextAction: "review diff", Files: gitutil.ChangedFilesSince(e.Root, taskBase), SessionKeys: e.taskSessions(taskKey)})
+			if err := e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "reviewer", Status: "running", TestStatus: testStatus, NextAction: "review diff", Files: gitutil.ChangedFilesSince(e.Root, taskBase), SessionKeys: e.taskSessions(taskKey)}); err != nil {
+				return err
+			}
 			reviewPrompt, _ := e.prompt("reviewer", task, taskKey)
 			e.emit("Reviewer (" + reviewer + ")")
-			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "agent_started", Status: "running", Evidence: []string{fmt.Sprintf("diffs/task-%03d.patch.enc", ordinal+1)}}); err != nil {
+			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "agent_started", Status: "running", Evidence: []string{fmt.Sprintf("diffs/task-%03d-attempt-%02d.patch.enc", ordinal+1, state.Attempt)}}); err != nil {
 				return err
 			}
 			reviewInput := e.limitRoleInput("reviewer", reviewPrompt+"\nCURRENT DIFF:\n"+diff)
 			review, err := e.runRole(ctx, "reviewer", reviewInput, taskKey, turns, metrics)
-			_ = e.saveSessionState()
-			_ = record.LogAttempt(ordinal+1, state.Attempt, "reviewer", review)
+			if saveErr := e.saveSessionState(); saveErr != nil {
+				return fmt.Errorf("persist session state: %w", saveErr)
+			}
+			if logErr := record.LogAttempt(ordinal+1, state.Attempt, "reviewer", review); logErr != nil {
+				return fmt.Errorf("persist reviewer transcript: %w", logErr)
+			}
 			reviewerStatus := "completed"
 			if err != nil {
 				reviewerStatus = "failed"
@@ -346,7 +384,9 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return eventErr
 			}
 			if err != nil {
-				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
+				if metricErr := record.UpdateTaskMetrics(ordinal+1, metrics); metricErr != nil {
+					return metricErr
+				}
 				if retryableError(err) && state.Attempt < maxRetries {
 					if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "retry_scheduled", Status: "retrying", Error: auditError(err)}); eventErr != nil {
 						return eventErr
@@ -362,10 +402,12 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(review), 0644); err != nil {
 				return err
 			}
-			decisionRecorded := "STATUS: CHANGES_REQUESTED"
 			decisionStatus := "changes_requested"
-			if hasMarker(review, "STATUS: LGTM") {
-				decisionRecorded = "STATUS: LGTM"
+			decisionRecorded, decisionErr := parseReviewerDecision(review)
+			if decisionErr != nil {
+				return decisionErr
+			}
+			if decisionRecorded == "STATUS: LGTM" {
 				decisionStatus = "approved"
 			}
 			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "review_decision", Status: decisionStatus, Decision: decisionRecorded}); err != nil {
@@ -381,13 +423,17 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 					return err
 				}
 				e.emit("Reviewer requested changes")
-				_ = writeContextSummary(e.Root, task, metrics)
+				if summaryErr := writeContextSummary(e.Root, task, metrics); summaryErr != nil {
+					return summaryErr
+				}
 				continue
 			}
 
 			judge := e.Config.Agents["judge"]
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Judge", judge, "")
-			_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "judge", Status: "running", NextAction: "resolve review disagreement", Files: gitutil.ChangedFilesSince(e.Root, taskBase), SessionKeys: e.taskSessions(taskKey)})
+			if err := e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "judge", Status: "running", NextAction: "resolve review disagreement", Files: gitutil.ChangedFilesSince(e.Root, taskBase), SessionKeys: e.taskSessions(taskKey)}); err != nil {
+				return err
+			}
 			judgePrompt, _ := e.prompt("judge", task, taskKey)
 			e.emit("Judge (" + judge + ")")
 			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "judge", Agent: judge, Type: "agent_started", Status: "running"}); err != nil {
@@ -395,8 +441,12 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 			judgeInput := e.limitRoleInput("judge", judgePrompt+"\nREVIEW:\n"+review+"\nCURRENT DIFF:\n"+diff)
 			verdict, err := e.runRole(ctx, "judge", judgeInput, taskKey, turns, metrics)
-			_ = e.saveSessionState()
-			_ = record.LogAttempt(ordinal+1, state.Attempt, "judge", verdict)
+			if saveErr := e.saveSessionState(); saveErr != nil {
+				return fmt.Errorf("persist session state: %w", saveErr)
+			}
+			if logErr := record.LogAttempt(ordinal+1, state.Attempt, "judge", verdict); logErr != nil {
+				return fmt.Errorf("persist judge transcript: %w", logErr)
+			}
 			judgeStatus := "completed"
 			if err != nil {
 				judgeStatus = "failed"
@@ -405,13 +455,18 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return eventErr
 			}
 			if err != nil {
-				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
+				if metricErr := record.UpdateTaskMetrics(ordinal+1, metrics); metricErr != nil {
+					return metricErr
+				}
 				return err
 			}
 			if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(verdict), 0644); err != nil {
 				return err
 			}
-			judgeDecision := normalizeJudgeVerdict(verdict)
+			judgeDecision, decisionErr := parseJudgeDecision(verdict)
+			if decisionErr != nil {
+				return decisionErr
+			}
 			if judgeDecision == "VERDICT: OVERRIDE_APPROVE" {
 				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "judge", Agent: judge, Type: "judge_decision", Status: "approved", Decision: "VERDICT: OVERRIDE_APPROVE"}); err != nil {
 					return err
@@ -435,19 +490,29 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			coderPrompt, _ := e.prompt("coder", task, taskKey)
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Coder (bonus)", coder, "FINAL_INSTRUCTIONS")
 			bonusOutput, err := e.runRole(ctx, "coder", coderPrompt, taskKey, turns, metrics)
-			_ = e.saveSessionState()
-			_ = record.LogAttempt(ordinal+1, state.Attempt, "coder-bonus", bonusOutput)
+			if saveErr := e.saveSessionState(); saveErr != nil {
+				return fmt.Errorf("persist session state: %w", saveErr)
+			}
+			if logErr := record.LogAttempt(ordinal+1, state.Attempt, "coder-bonus", bonusOutput); logErr != nil {
+				return fmt.Errorf("persist bonus coder transcript: %w", logErr)
+			}
 			if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "coder", Agent: coder, Type: "bonus_coder_finished", Status: statusFromError(err), Error: auditError(err), OutputRef: fmt.Sprintf("logs/tasks/%03d-attempt-%02d-coder-bonus.enc", ordinal+1, state.Attempt)}); eventErr != nil {
 				return eventErr
 			}
 			if err != nil {
-				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
+				if metricErr := record.UpdateTaskMetrics(ordinal+1, metrics); metricErr != nil {
+					return metricErr
+				}
 				return fmt.Errorf("final coder turn failed: %w", err)
 			}
 			if e.Config.TestCommand != "" {
-				testOut, testErr := runTest(ctx, e.Root, e.Config.TestCommand)
+				testResult := runTestDetailed(ctx, e.Root, e.Config.TestCommand)
+				testOut, testErr := testResult.Output, testResult.Err
 				if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "test_output.log"), []byte(testOut), 0644); err != nil {
 					return err
+				}
+				if _, evidenceErr := record.LogTestEvidence(ordinal+1, state.Attempt, history.TestEvidence{Command: e.Config.TestCommand, Workdir: e.Root, StartedAt: testResult.StartedAt, FinishedAt: testResult.FinishedAt, Duration: testResult.FinishedAt.Sub(testResult.StartedAt), ExitCode: testResult.ExitCode, Status: statusFromError(testErr), Output: testOut}); evidenceErr != nil {
+					return fmt.Errorf("persist final test evidence: %w", evidenceErr)
 				}
 				if testErr != nil {
 					return fmt.Errorf("final coder tests failed: %w", testErr)
@@ -460,7 +525,9 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			if err := os.WriteFile(gitutil.SafeDiffPath(e.Root), []byte(finalDiff), 0644); err != nil {
 				return err
 			}
-			_ = record.Diff(ordinal+1, finalDiff)
+			if err := record.DiffAttempt(ordinal+1, state.Attempt, finalDiff); err != nil {
+				return fmt.Errorf("persist final task %d attempt %d diff: %w", ordinal+1, state.Attempt, err)
+			}
 			completed = true
 			e.emit("✓ final coder turn complete")
 		}
@@ -475,8 +542,12 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return err
 			}
 			activeTaskFinished = true
-			_ = writeContextSummary(e.Root, task, metrics)
-			_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "completed", Status: "completed", NextAction: "next roadmap task", Files: gitutil.ChangedFilesSince(e.Root, taskBase), SessionKeys: e.taskSessions(taskKey)})
+			if summaryErr := writeContextSummary(e.Root, task, metrics); summaryErr != nil {
+				return summaryErr
+			}
+			if err := e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "completed", Status: "completed", NextAction: "next roadmap task", Files: gitutil.ChangedFilesSince(e.Root, taskBase), SessionKeys: e.taskSessions(taskKey)}); err != nil {
+				return err
+			}
 			_ = os.Remove(promptPath)
 			if !e.Config.Simulation {
 				if err := completeTask(e.Root, roadmapPath, lines, idx, task, state); err != nil {
@@ -632,6 +703,8 @@ func (e *Engine) runRole(ctx context.Context, role, prompt, taskKey string, turn
 	if budget.MaxOutputTokens > 0 && budget.MaxOutputTokens*4 < maxOutputChars {
 		maxOutputChars = budget.MaxOutputTokens * 4
 	}
+	// Keep the full provider transcript for encrypted audit history. Only the
+	// bounded copy is used for session extraction and downstream prompts.
 	output := limitOutput(rawOutput, maxOutputChars)
 	if e.Config.SessionsEnabled() {
 		if session := extractSessionID(output); session != "" {
@@ -651,7 +724,7 @@ func (e *Engine) runRole(ctx context.Context, role, prompt, taskKey string, turn
 	}
 	inputTokens, outputTokens := parseTokenMetrics(rawOutput)
 	metrics[key] = history.AgentMetric{Role: role, CLI: e.Config.Agents[role], Model: e.Config.Models[role], Effort: budget.Effort, Turns: turns[role], InputChars: len(prompt), OutputChars: len(rawOutput), InputTokens: inputTokens, OutputTokens: outputTokens, EstimatedTokens: estimateTokens(prompt) + estimateTokens(rawOutput), Duration: time.Since(started), Status: status, Retryable: retryableError(err), Error: errorText(err), SessionID: e.Sessions[e.sessionKey(taskKey, role)], ContextMode: contextMode, SessionResumed: sessionResumed, FallbackUsed: fallbackUsed}
-	return output, err
+	return rawOutput, err
 }
 
 func (e *Engine) sessionKey(taskKey, role string) string {
@@ -746,25 +819,6 @@ func isSessionResumeFailure(err error) bool {
 var sessionIDRE = regexp.MustCompile(`(?i)(?:session[_ -]?id|sessionId|thread[_ -]?id|conversation[_ -]?id)\s*[=:]\s*["']?([a-z0-9-]{16,})`)
 
 var tokenMetricRE = regexp.MustCompile(`(?i)(input|prompt|output|completion)?\s*tokens?\s*(?:used|:|=)\s*([0-9,]+)`)
-
-var judgeVerdictRE = regexp.MustCompile(`(?i)^judge\s+verdict:\s*\**(pass|approved)\**\.?$`)
-
-var explicitJudgeDecisionRE = regexp.MustCompile(`(?i)^(?:judge\s+verdict|ruling|decision|judgment|judgement|final\s+verdict|verdict):\s*\**(approved|approve|pass|override[_ -]?approve|final[_ -]?instructions)\**\.?$`)
-
-var judgeApprovalStatementRE = regexp.MustCompile(`(?i)^(?:action|ruling|decision|verdict):\s*\**(accepted|accept|approved|approve|pass)\**(?:\s|[.,:]).*$`)
-
-var judgeApprovalSummaryRE = regexp.MustCompile(`(?i)^(?:action|ruling|decision|judgment|judgement|final\s+verdict|verdict):\s*\**.*\b(accepted|approved|completed|complete|pass)\b.*$`)
-
-var judgeApprovalBulletRE = regexp.MustCompile(`(?i)^[-*]\s*(accepted|accept|approved|approve|pass)\b.*$`)
-
-var judgeNoDisagreementRE = regexp.MustCompile(`(?i)^(?:judge\s+resolution|disagreement\s+check|disagreement\s+resolution):.*\b(?:no\s+disagreement|none|no\s+substantive\s+disagreement)\b.*$`)
-
-// Some judges summarize an accepted review in prose instead of emitting the
-// adapter marker. Require both an explicit reviewer approval and a concrete
-// handoff to the next task before treating that prose as an approval.
-var judgeReviewerHandoffRE = regexp.MustCompile(`(?is)reviewer\b[^.\n]{0,120}\b(?:approved|approve)\b.*\b(?:ready\s+for|proceed\s+to)\s+task\b`)
-
-var judgeCanonicalRE = regexp.MustCompile("(?i)verdict\\s*:\\s*[#>*_` -]*(override[_ -]?approve|final[_ -]?instructions)")
 
 func extractSessionID(output string) string {
 	match := sessionIDRE.FindStringSubmatch(output)
@@ -1053,95 +1107,66 @@ func completeTask(root, roadmapPath string, lines []string, idx int, task string
 }
 
 func runTest(ctx context.Context, root, command string) (string, error) {
+	r := runTestDetailed(ctx, root, command)
+	return r.Output, r.Err
+}
+
+type testResult struct {
+	Output     string
+	Err        error
+	StartedAt  time.Time
+	FinishedAt time.Time
+	ExitCode   int
+}
+
+func runTestDetailed(ctx context.Context, root, command string) testResult {
+	started := time.Now().UTC()
 	c := exec.CommandContext(ctx, "sh", "-c", command)
 	c.Dir = root
 	b, err := c.CombinedOutput()
-	return string(b), err
+	result := testResult{Output: string(b), Err: err, StartedAt: started, FinishedAt: time.Now().UTC(), ExitCode: 0}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		result.ExitCode = exitErr.ExitCode()
+	}
+	return result
 }
 
-func hasMarker(output, marker string) bool {
-	for _, line := range strings.Split(output, "\n") {
-		if strings.TrimSpace(line) == marker {
-			return true
+// parseDecision accepts only one exact protocol marker outside quoted or
+// fenced examples. Narrative, bullets, contradictory markers, and adapter
+// prose are deliberately rejected because they cannot safely drive state.
+func parseDecision(output string, markers ...string) (string, error) {
+	allowed := make(map[string]bool, len(markers))
+	for _, marker := range markers {
+		allowed[marker] = true
+	}
+	var found []string
+	fenced := false
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "```") {
+			fenced = !fenced
+			continue
+		}
+		if fenced || strings.HasPrefix(line, ">") || strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") {
+			continue
+		}
+		line = strings.TrimSpace(strings.Trim(line, "*_`# "))
+		if allowed[line] {
+			found = append(found, line)
 		}
 	}
-	return strings.Contains(output, marker)
+	if len(found) != 1 {
+		return "", fmt.Errorf("agent decision protocol invalid: expected exactly one marker (%s), found %d", strings.Join(markers, ", "), len(found))
+	}
+	return found[0], nil
 }
 
-// normalizeJudgeVerdict preserves the strict protocol while accepting one
-// explicit, human-readable form emitted by some CLI adapters. Plain
-// "APPROVE" or "PASS" remains invalid because it is too ambiguous to drive
-// orchestration safely.
-func normalizeJudgeVerdict(output string) string {
-	if match := judgeCanonicalRE.FindStringSubmatch(output); len(match) == 2 {
-		decision := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(match[1], "_", "-"), " ", "-"))
-		if decision == "final-instructions" {
-			return "VERDICT: FINAL_INSTRUCTIONS"
-		}
-		return "VERDICT: OVERRIDE_APPROVE"
-	}
-	if hasMarker(output, "VERDICT: OVERRIDE_APPROVE") {
-		return "VERDICT: OVERRIDE_APPROVE"
-	}
-	if hasMarker(output, "VERDICT: FINAL_INSTRUCTIONS") {
-		return "VERDICT: FINAL_INSTRUCTIONS"
-	}
-	if judgeReviewerHandoffRE.MatchString(output) {
-		return "VERDICT: OVERRIDE_APPROVE"
-	}
-	pendingAction := false
-	noDisagreement := false
-	for _, rawLine := range strings.Split(output, "\n") {
-		line := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(rawLine), "# "))
-		// Some adapters wrap the complete labeled decision in Markdown
-		// emphasis, for example **Verdict: approved.**. Remove only outer
-		// decoration; the explicit label remains mandatory.
-		line = strings.TrimSpace(strings.Trim(line, "*_ "))
-		line = strings.Replace(line, ":**", ":", 1)
-		line = strings.Replace(line, ":__", ":", 1)
-		if judgeNoDisagreementRE.MatchString(line) {
-			noDisagreement = true
-		}
-		if noDisagreement && strings.Contains(strings.ToLower(line), "task") &&
-			(strings.Contains(strings.ToLower(line), "complete") || strings.Contains(strings.ToLower(line), "approved")) {
-			return "VERDICT: OVERRIDE_APPROVE"
-		}
-		if pendingAction && judgeApprovalBulletRE.MatchString(line) {
-			return "VERDICT: OVERRIDE_APPROVE"
-		}
-		pendingAction = strings.EqualFold(strings.TrimSpace(line), "action:")
-		switch strings.ToUpper(line) {
-		case "JUDGE VERDICT: APPROVED":
-			return "VERDICT: OVERRIDE_APPROVE"
-		case "JUDGE VERDICT: FINAL_INSTRUCTIONS", "JUDGE VERDICT: FINAL INSTRUCTIONS":
-			return "VERDICT: FINAL_INSTRUCTIONS"
-		}
-		if match := judgeVerdictRE.FindStringSubmatch(line); len(match) == 2 {
-			return "VERDICT: OVERRIDE_APPROVE"
-		}
-		if match := explicitJudgeDecisionRE.FindStringSubmatch(line); len(match) == 2 {
-			decision := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(match[1], "_", "-"), " ", "-"))
-			if decision == "final-instructions" {
-				return "VERDICT: FINAL_INSTRUCTIONS"
-			}
-			return "VERDICT: OVERRIDE_APPROVE"
-		}
-		if judgeApprovalStatementRE.MatchString(line) {
-			return "VERDICT: OVERRIDE_APPROVE"
-		}
-		if judgeApprovalSummaryRE.MatchString(line) {
-			lower := strings.ToLower(line)
-			if !strings.Contains(lower, "not approved") &&
-				!strings.Contains(lower, "not accepted") &&
-				!strings.Contains(lower, "rejected") &&
-				!strings.Contains(lower, "blocked") &&
-				!strings.Contains(lower, "changes requested") &&
-				!strings.Contains(lower, "failed") {
-				return "VERDICT: OVERRIDE_APPROVE"
-			}
-		}
-	}
-	return ""
+func parseReviewerDecision(output string) (string, error) {
+	return parseDecision(output, "STATUS: LGTM", "STATUS: CHANGES_REQUESTED")
+}
+
+func parseJudgeDecision(output string) (string, error) {
+	return parseDecision(output, "VERDICT: OVERRIDE_APPROVE", "VERDICT: FINAL_INSTRUCTIONS")
 }
 
 func tokenCountFromFiles(root string) int {

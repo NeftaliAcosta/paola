@@ -27,14 +27,15 @@ import (
 const version = "0.1.16"
 
 var (
-	headless      bool
-	worktree      bool
-	baseBranch    string
-	simulate      bool
-	contextFile   string
-	objectiveFile string
-	roadmapFile   string
-	rulesFile     string
+	headless            bool
+	worktree            bool
+	baseBranch          string
+	simulate            bool
+	contextFile         string
+	objectiveFile       string
+	roadmapFile         string
+	rulesFile           string
+	historyExportOutput string
 )
 var rootCmd = &cobra.Command{Use: "paola", Short: "Polymorphic Autonomous Orchestrator for Local Agents", Version: version, SilenceUsage: true}
 
@@ -94,7 +95,20 @@ func init() {
 	editRoot := &cobra.Command{Use: "edit", Short: "Edit PAOLA configuration"}
 	editRoot.AddCommand(&cobra.Command{Use: "agents", Short: "Reconfigure agent roles, models, effort, and command templates", RunE: configEditCommand})
 	rootCmd.AddCommand(editRoot)
-	rootCmd.AddCommand(&cobra.Command{Use: "history", Short: "List previous orchestration runs", RunE: historyCommand})
+	historyCmd := &cobra.Command{Use: "history", Short: "List previous orchestration runs", RunE: historyCommand}
+	exportCmd := &cobra.Command{Use: "export <execution-id>", Args: cobra.ExactArgs(1), Short: "Export a redacted audit bundle", RunE: func(_ *cobra.Command, args []string) error {
+		r, err := root()
+		if err != nil {
+			return err
+		}
+		if historyExportOutput == "" {
+			return fmt.Errorf("--output is required")
+		}
+		return paolahistory.Export(r, args[0], historyExportOutput)
+	}}
+	exportCmd.Flags().StringVarP(&historyExportOutput, "output", "o", "", "directory for the exported audit bundle")
+	historyCmd.AddCommand(exportCmd)
+	rootCmd.AddCommand(historyCmd)
 	rootCmd.AddCommand(&cobra.Command{Use: "update", Short: "Check self-update status", RunE: func(*cobra.Command, []string) error {
 		fmt.Printf("paola %s is current; self-update provider is ready for GitHub releases.\n", version)
 		return nil

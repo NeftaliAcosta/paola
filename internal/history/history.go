@@ -51,6 +51,7 @@ type Event struct {
 	Error       string    `json:"error,omitempty"`
 	OutputRef   string    `json:"output_ref,omitempty"`
 	Evidence    []string  `json:"evidence,omitempty"`
+	Synthetic   bool      `json:"synthetic,omitempty"`
 	At          time.Time `json:"at"`
 }
 type TaskRecord struct {
@@ -87,6 +88,17 @@ type AgentMetric struct {
 	ContextMode     string        `json:"context_mode,omitempty"`
 	SessionResumed  bool          `json:"session_resumed,omitempty"`
 	FallbackUsed    bool          `json:"session_fallback_used,omitempty"`
+}
+
+type TestEvidence struct {
+	Command    string        `json:"command"`
+	Workdir    string        `json:"workdir"`
+	StartedAt  time.Time     `json:"started_at"`
+	FinishedAt time.Time     `json:"finished_at"`
+	Duration   time.Duration `json:"duration_ns"`
+	ExitCode   int           `json:"exit_code"`
+	Status     string        `json:"status"`
+	Output     string        `json:"output"`
 }
 type Recorder struct {
 	root     string
@@ -203,9 +215,6 @@ func (r *Recorder) Log(taskIndex int, role, output string) error {
 
 // LogAttempt keeps every role transcript, including repeated attempts.
 func (r *Recorder) LogAttempt(taskIndex, attempt int, role, output string) error {
-	if strings.TrimSpace(output) == "" {
-		return nil
-	}
 	suffix := role
 	if attempt > 0 {
 		suffix = fmt.Sprintf("attempt-%02d-%s", attempt, role)
@@ -214,11 +223,32 @@ func (r *Recorder) LogAttempt(taskIndex, attempt int, role, output string) error
 	return writeEncrypted(p, r.key, []byte(output))
 }
 func (r *Recorder) Diff(taskIndex int, diff string) error {
+	return r.DiffAttempt(taskIndex, 0, diff)
+}
+
+// DiffAttempt preserves a separate encrypted diff for every task attempt.
+// Attempt zero keeps compatibility with older callers and history readers.
+func (r *Recorder) DiffAttempt(taskIndex, attempt int, diff string) error {
 	if strings.TrimSpace(diff) == "" {
 		return nil
 	}
-	p := filepath.Join(r.dir, "diffs", fmt.Sprintf("task-%03d.patch.enc", taskIndex))
+	name := fmt.Sprintf("task-%03d.patch.enc", taskIndex)
+	if attempt > 0 {
+		name = fmt.Sprintf("task-%03d-attempt-%02d.patch.enc", taskIndex, attempt)
+	}
+	p := filepath.Join(r.dir, "diffs", name)
 	return writeEncrypted(p, r.key, []byte(diff))
+}
+
+// LogTestEvidence stores test output per task attempt instead of reusing the
+// mutable state/test_output.log file as historical evidence.
+func (r *Recorder) LogTestEvidence(taskIndex, attempt int, evidence TestEvidence) (string, error) {
+	ref := filepath.Join("evidence", "tasks", fmt.Sprintf("%03d", taskIndex), fmt.Sprintf("attempt-%02d-tests.enc", attempt))
+	b, err := json.MarshalIndent(evidence, "", "  ")
+	if err != nil {
+		return ref, err
+	}
+	return ref, writeEncrypted(filepath.Join(r.dir, ref), r.key, b)
 }
 
 func List(root string) ([]Manifest, error) {
@@ -268,7 +298,7 @@ func migrateLegacy(m *Manifest) bool {
 	sequence := 0
 	add := func(taskIndex int, task, eventType, status, errText string, at time.Time) {
 		sequence++
-		m.Events = append(m.Events, Event{ID: fmt.Sprintf("%s-%06d", m.ID, sequence), Sequence: sequence, ExecutionID: m.ID, TaskIndex: taskIndex, Task: task, Type: eventType, Status: status, Error: trimError(errText), At: at})
+		m.Events = append(m.Events, Event{ID: fmt.Sprintf("%s-%06d", m.ID, sequence), Sequence: sequence, ExecutionID: m.ID, TaskIndex: taskIndex, Task: task, Type: eventType, Status: status, Error: trimError(errText), Synthetic: true, At: at})
 	}
 	add(0, "", "execution_started", "running", "", m.StartedAt)
 	for _, task := range m.Tasks {
@@ -325,9 +355,34 @@ func LoadDiff(root string, manifest Manifest, taskIndex int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	p := filepath.Join(root, config.Dir, "history", "tasks", safeTitle(manifest.TaskTitle), "iterations", manifest.ID, "diffs", fmt.Sprintf("task-%03d.patch.enc", taskIndex))
+	dir := filepath.Join(root, config.Dir, "history", "tasks", safeTitle(manifest.TaskTitle), "iterations", manifest.ID, "diffs")
+	paths, _ := filepath.Glob(filepath.Join(dir, fmt.Sprintf("task-%03d-attempt-*.patch.enc", taskIndex)))
+	if len(paths) > 0 {
+		b, readErr := readEncrypted(paths[len(paths)-1], key)
+		if readErr == nil {
+			return string(b), nil
+		}
+	}
+	return LoadDiffAttempt(root, manifest, taskIndex, 0)
+}
+
+// LoadDiffAttempt reads the attempt-specific diff and falls back to the
+// legacy task-only path for manifests written before attempt isolation.
+func LoadDiffAttempt(root string, manifest Manifest, taskIndex, attempt int) (string, error) {
+	key, err := loadKey(root)
+	if err != nil {
+		return "", err
+	}
+	name := fmt.Sprintf("task-%03d.patch.enc", taskIndex)
+	if attempt > 0 {
+		name = fmt.Sprintf("task-%03d-attempt-%02d.patch.enc", taskIndex, attempt)
+	}
+	p := filepath.Join(root, config.Dir, "history", "tasks", safeTitle(manifest.TaskTitle), "iterations", manifest.ID, "diffs", name)
 	b, err := readEncrypted(p, key)
 	if err != nil {
+		if attempt > 0 && os.IsNotExist(err) {
+			return LoadDiff(root, manifest, taskIndex)
+		}
 		return "", err
 	}
 	return string(b), nil
@@ -410,7 +465,31 @@ func writeEncrypted(path string, key, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, sealed, 0600)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".paola-write-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil && runtime.GOOS != "windows" {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(sealed); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 func readEncrypted(path string, key []byte) ([]byte, error) {
 	sealed, err := os.ReadFile(path)
