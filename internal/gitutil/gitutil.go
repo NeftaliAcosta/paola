@@ -42,6 +42,14 @@ func CreateExecutionWorktree(root, title, baseBranch string) (string, string, er
 		_, _ = run(root, "worktree", "remove", "--force", path)
 		return "", "", fmt.Errorf("link PAOLA workspace into worktree: %w", err)
 	}
+	// A worktree exposes .paola as a symlink, so a directory-only ignore
+	// pattern (".paola/") does not hide it. Ensure the worktree also has
+	// the file/symlink-safe local exclusion before agents start working.
+	if err := EnsureLocalExclude(path); err != nil {
+		_ = os.Remove(filepath.Join(path, ".paola"))
+		_, _ = run(root, "worktree", "remove", "--force", path)
+		return "", "", fmt.Errorf("configure PAOLA worktree exclusion: %w", err)
+	}
 	return path, branch, nil
 }
 
@@ -51,6 +59,25 @@ func run(root string, args ...string) ([]byte, error) {
 	return c.CombinedOutput()
 }
 func CaptureDiff(root string) (string, error) {
+	base, _ := Head(root)
+	return CaptureDiffSince(root, base)
+}
+
+// Head returns the current commit. An empty result means the repository has
+// no commit yet.
+func Head(root string) (string, error) {
+	b, err := run(root, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// CaptureDiffSince captures project changes made after base, including commits
+// created by an agent plus staged, unstaged, and new files. This is important
+// because agents are allowed to commit their work before PAOLA evaluates the
+// task gate.
+func CaptureDiffSince(root, base string) (string, error) {
 	// Ask Git for untracked, non-ignored files instead of using `git add -N .`.
 	// The latter still visits ignored directories and fails when .paola/ is
 	// correctly excluded through .git/info/exclude.
@@ -71,8 +98,29 @@ func CaptureDiff(root string) (string, error) {
 			return "", err
 		}
 	}
-	b, err = run(root, "diff", "--", ".", ":(exclude).paola/**")
-	return string(b), err
+	return diffAgainst(root, base)
+}
+
+// diffAgainstHEAD captures both staged and unstaged project changes. Agents
+// commonly stage their report before finishing; plain `git diff` would miss
+// those additions and incorrectly trigger the no-project-changes gate.
+func diffAgainst(root, base string) (string, error) {
+	if base != "" {
+		b, err := run(root, "diff", base, "--", ".", ":(exclude).paola", ":(exclude).paola/**")
+		return string(b), err
+	}
+
+	// An unborn repository has no HEAD to compare against. Keep support for
+	// that valid Git state by combining its index and working-tree diffs.
+	staged, err := run(root, "diff", "--cached", "--", ".", ":(exclude).paola", ":(exclude).paola/**")
+	if err != nil {
+		return "", err
+	}
+	unstaged, err := run(root, "diff", "--", ".", ":(exclude).paola", ":(exclude).paola/**")
+	if err != nil {
+		return "", err
+	}
+	return string(staged) + string(unstaged), nil
 }
 func Commit(root, task string) error {
 	// .paola/ is excluded by Git's local exclude file. Git add -A respects that
@@ -109,8 +157,24 @@ func EnsureLocalExclude(root string) error {
 			break
 		}
 	}
-	if !hasEntry {
-		entry := "# Paola local workspace\n.paola/\n"
+	// ".paola/" ignores a directory but not the symlink used by isolated
+	// worktrees. Keep the directory rule for normal checkouts and add the
+	// exact path rule so both forms remain invisible to Git.
+	hasExactEntry := false
+	for _, line := range strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n") {
+		if strings.TrimSpace(line) == ".paola" {
+			hasExactEntry = true
+			break
+		}
+	}
+	if !hasEntry || !hasExactEntry {
+		entry := "# Paola local workspace\n"
+		if !hasEntry {
+			entry += ".paola/\n"
+		}
+		if !hasExactEntry {
+			entry += ".paola\n"
+		}
 		if content != "" && !strings.HasSuffix(content, "\n") {
 			content += "\n"
 		}
@@ -309,7 +373,26 @@ func semanticCommitMessage(task string) string {
 }
 
 func ChangedFiles(root string) []string {
-	b, err := run(root, "diff", "--name-only", "--", ".", ":(exclude).paola/**")
+	base, _ := Head(root)
+	return ChangedFilesSince(root, base)
+}
+
+func ChangedFilesSince(root, base string) []string {
+	var b []byte
+	var err error
+	if base != "" {
+		b, err = run(root, "diff", base, "--name-only", "--", ".", ":(exclude).paola", ":(exclude).paola/**")
+	} else {
+		b, err = run(root, "diff", "--cached", "--name-only", "--", ".", ":(exclude).paola", ":(exclude).paola/**")
+		if err == nil {
+			unstaged, unstagedErr := run(root, "diff", "--name-only", "--", ".", ":(exclude).paola", ":(exclude).paola/**")
+			if unstagedErr == nil {
+				b = append(b, unstaged...)
+			} else {
+				err = unstagedErr
+			}
+		}
+	}
 	if err != nil {
 		return nil
 	}

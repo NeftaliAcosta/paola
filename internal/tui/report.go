@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -12,10 +14,12 @@ import (
 type reportModel struct {
 	viewport      viewport.Model
 	title         string
+	content       string
 	width         int
 	height        int
 	action        string
 	allowFileView bool
+	message       string
 }
 
 // ShowReport renders long history output inside a full-screen, scrollable
@@ -30,7 +34,7 @@ func ShowDiffReport(title, content string) (string, error) {
 }
 
 func showReport(title, content string, allowFileView bool) (string, error) {
-	m := reportModel{title: title, width: 100, height: 30, action: "back", allowFileView: allowFileView, viewport: viewport.New(90, 22)}
+	m := reportModel{title: title, content: content, width: 100, height: 30, action: "back", allowFileView: allowFileView, viewport: viewport.New(90, 22)}
 	m.viewport.SetContent(colorizeReport(content))
 	finalModel, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run()
 	if err != nil {
@@ -58,7 +62,7 @@ func colorizeReport(content string) string {
 			out = append(out, good.Render(line))
 		case strings.HasPrefix(line, "-"):
 			out = append(out, bad.Render(line))
-		case strings.HasSuffix(line, "SUMMARY"), line == "TIMELINE", line == "PARAMETERS":
+		case strings.HasSuffix(line, "SUMMARY"), line == "TIMELINE", line == "EVENT TRACE", line == "PARAMETERS":
 			out = append(out, section.Render(line))
 		case strings.HasPrefix(line, "✓") || strings.Contains(line, "completed"):
 			out = append(out, good.Render(line))
@@ -86,6 +90,13 @@ func (m reportModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Height = max(6, v.Height-6)
 	case tea.KeyMsg:
 		switch v.String() {
+		case "c", "C":
+			if err := copyToClipboard(m.content); err != nil {
+				m.message = "Copy failed: " + err.Error()
+			} else {
+				m.message = "Report copied to clipboard"
+			}
+			return m, nil
 		case "v", "V":
 			if !m.allowFileView {
 				break
@@ -109,10 +120,52 @@ func (m reportModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m reportModel) View() string {
 	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("PAOLA · HISTORY · " + m.title)
 	body := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1).Width(max(20, m.width-4)).Render(m.viewport.View())
-	footerText := "↑/↓ scroll · PageUp/PageDown · mouse wheel · [q/Esc] back"
+	footerText := "↑/↓ scroll · PageUp/PageDown · mouse wheel · [c] copy · [q/Esc] back"
 	if m.allowFileView {
-		footerText = "↑/↓ scroll · PageUp/PageDown · mouse wheel · [v] view files · [q/Esc] back"
+		footerText = "↑/↓ scroll · PageUp/PageDown · mouse wheel · [c] copy · [v] view files · [q/Esc] back"
+	}
+	if m.message != "" {
+		footerText += " · " + m.message
 	}
 	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render(footerText)
 	return fmt.Sprintf("%s\n\n%s\n\n%s", header, body, footer)
+}
+
+func copyToClipboard(content string) error {
+	commands := map[string][]string{
+		"darwin":  {"pbcopy"},
+		"linux":   {"wl-copy"},
+		"windows": {"clip"},
+	}
+	for _, command := range commands[runtime.GOOS] {
+		if _, err := exec.LookPath(command); err != nil {
+			continue
+		}
+		cmd := exec.Command(command)
+		cmd.Stdin = strings.NewReader(content)
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+		return nil
+	}
+	if runtime.GOOS == "linux" {
+		for _, command := range []string{"xclip", "xsel"} {
+			if _, err := exec.LookPath(command); err != nil {
+				continue
+			}
+			args := []string{}
+			if command == "xclip" {
+				args = []string{"-selection", "clipboard"}
+			} else {
+				args = []string{"--clipboard", "--input"}
+			}
+			cmd := exec.Command(command, args...)
+			cmd.Stdin = strings.NewReader(content)
+			if err := cmd.Run(); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("no clipboard utility available")
 }

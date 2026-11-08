@@ -38,6 +38,7 @@ type Config struct {
 	AgentIdleTimeoutMinutes int                     `yaml:"agent_idle_timeout_minutes,omitempty"`
 	Simulation              bool                    `yaml:"simulation,omitempty"`
 	ReuseSessions           bool                    `yaml:"reuse_sessions,omitempty"`
+	SessionStrategy         string                  `yaml:"session_strategy,omitempty"`
 	WorktreePerRun          bool                    `yaml:"worktree_per_run,omitempty"`
 	RetryBackoffSeconds     int                     `yaml:"retry_backoff_seconds,omitempty"`
 	Budgets                 map[string]RoleBudget   `yaml:"budgets,omitempty"`
@@ -46,6 +47,7 @@ type Config struct {
 	Commands                map[string]AgentCommand `yaml:"commands"`
 }
 type State struct {
+	ExecutionID string            `json:"execution_id,omitempty"`
 	CurrentTask int               `json:"current_task"`
 	Attempt     int               `json:"attempt"`
 	Status      string            `json:"status"`
@@ -54,11 +56,38 @@ type State struct {
 }
 
 func Default(project string) Config {
-	return Config{ProjectName: project, TaskTitle: "", MaxRetries: 1, AgentIdleTimeoutMinutes: 30, Budgets: defaultBudgets(), Agents: map[string]string{"coder": "codex", "reviewer": "codex", "judge": "agy"}, Models: map[string]string{"coder": "", "reviewer": "", "judge": ""}, Commands: map[string]AgentCommand{
-		"agy":    {Coder: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Reviewer: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Judge: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`},
-		"codex":  {Coder: `codex exec --full-auto {{model_args}} {{effort_args}} {{prompt}}`, Reviewer: `codex exec {{model_args}} {{effort_args}} {{prompt}}`, Judge: `codex exec {{model_args}} {{effort_args}} {{prompt}}`},
+	return Config{ProjectName: project, TaskTitle: "", MaxRetries: 1, AgentIdleTimeoutMinutes: 30, ReuseSessions: true, SessionStrategy: "task", Budgets: defaultBudgets(), Agents: map[string]string{"coder": "codex", "reviewer": "codex", "judge": "agy"}, Models: map[string]string{"coder": "", "reviewer": "", "judge": ""}, Commands: map[string]AgentCommand{
+		"agy": {Coder: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Reviewer: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`, Judge: `agy --dangerously-skip-permissions {{model_args}} -p {{prompt}}`},
+		// Codex treats resume as an exec subcommand. Keep it immediately after
+		// `codex exec`; placing it after the prompt/options makes newer Codex
+		// versions parse it as user input instead of a session selector.
+		"codex":  {Coder: `codex exec {{session_args}} --dangerously-bypass-approvals-and-sandbox {{model_args}} {{effort_args}} {{prompt}}`, Reviewer: `codex exec {{session_args}} {{model_args}} {{effort_args}} {{prompt}}`, Judge: `codex exec {{session_args}} {{model_args}} {{effort_args}} {{prompt}}`, SessionArgs: `resume {{session_id}}`},
 		"claude": {Coder: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} {{session_args}} -p {{prompt}}`, Reviewer: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} {{session_args}} -p {{prompt}}`, Judge: `claude --dangerously-skip-permissions {{model_args}} {{effort_args}} {{session_args}} -p {{prompt}}`, SessionArgs: `--resume {{session_id}}`},
 	}}
+}
+
+// EffectiveSessionStrategy returns the supported session lifecycle. "task"
+// scopes a provider conversation to one execution task and role. "none"
+// disables provider resume while retaining checkpoint-based continuation.
+// An omitted strategy enables task sessions for legacy workspaces; users who
+// need the old stateless behavior can opt out explicitly with
+// session_strategy: none.
+func (c Config) EffectiveSessionStrategy() string {
+	strategy := strings.ToLower(strings.TrimSpace(c.SessionStrategy))
+	if strategy == "none" || strategy == "off" {
+		return "none"
+	}
+	return "task"
+}
+
+func (c Config) SessionsEnabled() bool { return c.EffectiveSessionStrategy() != "none" }
+
+// DefaultAgentCommand returns PAOLA's current canonical templates for one CLI.
+// It is used by configuration tools to repair stale role commands without
+// requiring users to edit YAML by hand.
+func DefaultAgentCommand(name string) (AgentCommand, bool) {
+	command, ok := Default("").Commands[name]
+	return command, ok
 }
 
 func defaultBudgets() map[string]RoleBudget {

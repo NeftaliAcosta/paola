@@ -119,6 +119,10 @@ func (Runner) Run(ctx context.Context, root, cli, template, prompt, model string
 	timeout := idleTimeout(ctx)
 	cmd := exec.CommandContext(runCtx, "sh", "-c", command)
 	cmd.Dir = root
+	// PAOLA invokes agents non-interactively and passes the complete prompt as
+	// an argument. Explicit EOF prevents CLIs such as `codex exec` from waiting
+	// for a second prompt on stdin after processing the initial request.
+	cmd.Stdin = strings.NewReader("")
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", err

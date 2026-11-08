@@ -1,10 +1,14 @@
 package orchestrator
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
+	"github.com/neftaliacosta/paola/internal/config"
 	"github.com/neftaliacosta/paola/internal/history"
 )
 
@@ -41,6 +45,13 @@ func TestRetryableTextDetectsQuotaOutput(t *testing.T) {
 	}
 }
 
+func TestRetryableTextIgnoresSuccessfulReportMentioningCapacity(t *testing.T) {
+	output := "Checksums verified successfully.\nDocumented limitation: shared orchestration state changed externally; tracked isolation remains verified."
+	if retryableText(output) {
+		t.Fatal("successful report was classified as retryable")
+	}
+}
+
 func TestLimitOutputPreservesTail(t *testing.T) {
 	input := strings.Repeat("x", 200) + "TAIL"
 	got := limitOutput(input, 100)
@@ -70,5 +81,80 @@ func TestLimitTextRepairsInvalidUTF8(t *testing.T) {
 	}
 	if !strings.Contains(got, "before") || !strings.Contains(got, "after") {
 		t.Fatalf("context repair lost surrounding text: %q", got)
+	}
+}
+
+func TestSessionKeysAreScopedByExecutionTaskAndRole(t *testing.T) {
+	e := Engine{ExecutionID: "exec-1"}
+	if e.sessionKey("task-001", "coder") == e.sessionKey("task-002", "coder") {
+		t.Fatal("different tasks share a session key")
+	}
+	if e.sessionKey("task-001", "coder") == e.sessionKey("task-001", "reviewer") {
+		t.Fatal("different roles share a session key")
+	}
+}
+
+func TestSessionResumeFailureRequiresFailureEvidence(t *testing.T) {
+	if !isSessionResumeFailure(errors.New("session expired; resume unavailable")) {
+		t.Fatal("expired session was not detected")
+	}
+	if isSessionResumeFailure(errors.New("reviewer discussed the session thread")) {
+		t.Fatal("ordinary output was classified as session failure")
+	}
+}
+
+func TestCheckpointRoundTripAndContinuationDetection(t *testing.T) {
+	root := t.TempDir()
+	e := Engine{Root: root}
+	if err := e.saveCheckpoint(taskCheckpoint{Task: "demo", TaskIndex: 1, Attempt: 1, Stage: "reviewer", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	raw := e.readCheckpoint("task-001")
+	if !checkpointIsContinuation(raw) {
+		t.Fatal("reviewer checkpoint was not marked as continuation")
+	}
+	info, err := os.Stat(filepath.Join(root, ".paola", "state", "checkpoints", "task-001.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("checkpoint mode = %v; want 0600", info.Mode().Perm())
+	}
+}
+
+func TestPromptKeepsFirstCoderContextAndCompactsLaterStages(t *testing.T) {
+	root := t.TempDir()
+	for name, value := range map[string]string{
+		"CONTEXT.md":      strings.Repeat("project context ", 20),
+		"GOLDEN_RULES.md": strings.Repeat("rule ", 20),
+	} {
+		path := filepath.Join(root, ".paola", name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(value), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e := Engine{Root: root, ExecutionID: "exec-1", Config: config.Default("demo")}
+	if err := e.saveCheckpoint(taskCheckpoint{Task: "demo", TaskIndex: 1, Attempt: 1, Stage: "coder", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := e.prompt("coder", "demo", "task-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(first, "project context") {
+		t.Fatal("first coder prompt lost project context")
+	}
+	if err := e.saveCheckpoint(taskCheckpoint{Task: "demo", TaskIndex: 1, Attempt: 1, Stage: "reviewer", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	later, err := e.prompt("reviewer", "demo", "task-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(later, "project context project context project context") {
+		t.Fatal("later prompt replayed full static context")
 	}
 }

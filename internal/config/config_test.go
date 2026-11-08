@@ -1,6 +1,41 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestDefaultCodexCoderCommandUsesSupportedApprovalFlag(t *testing.T) {
+	command, ok := DefaultAgentCommand("codex")
+	if !ok {
+		t.Fatal("codex default command not found")
+	}
+	if strings.Contains(command.Coder, "--full-auto") {
+		t.Fatalf("codex command still contains deprecated --full-auto: %q", command.Coder)
+	}
+	if !strings.Contains(command.Coder, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Fatalf("codex command lacks supported approval flag: %q", command.Coder)
+	}
+	if command.SessionArgs != "resume {{session_id}}" {
+		t.Fatalf("codex session args = %q, want durable resume template", command.SessionArgs)
+	}
+}
+
+func TestDefaultEnablesTaskScopedSessions(t *testing.T) {
+	c := Default("demo")
+	if !c.SessionsEnabled() || c.EffectiveSessionStrategy() != "task" {
+		t.Fatalf("default session strategy = %q, enabled=%v", c.EffectiveSessionStrategy(), c.SessionsEnabled())
+	}
+}
+
+func TestLegacyConfigGetsTaskSessionsUnlessExplicitlyDisabled(t *testing.T) {
+	if !(Config{}).SessionsEnabled() {
+		t.Fatal("legacy config should gain task-scoped sessions")
+	}
+	if (Config{SessionStrategy: "none"}).SessionsEnabled() {
+		t.Fatal("explicit stateless strategy should disable sessions")
+	}
+}
 
 func TestEffectiveDefaultsDoNotMutateLoadedValues(t *testing.T) {
 	var c Config

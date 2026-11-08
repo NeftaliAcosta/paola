@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -23,7 +24,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const version = "0.1.10"
+const version = "0.1.12"
 
 var (
 	headless      bool
@@ -88,7 +89,11 @@ func init() {
 	run.Flags().StringVar(&baseBranch, "base-branch", "", "base branch for the isolated task branch")
 	run.Flags().BoolVar(&simulate, "simulate", false, "exercise workflow without invoking agents or modifying project files")
 	rootCmd.AddCommand(run)
-	rootCmd.AddCommand(&cobra.Command{Use: "config", Short: "Show configuration and agent health", RunE: configCommand})
+	configRoot := &cobra.Command{Use: "config", Short: "Show configuration and agent health", RunE: configCommand}
+	rootCmd.AddCommand(configRoot)
+	editRoot := &cobra.Command{Use: "edit", Short: "Edit PAOLA configuration"}
+	editRoot.AddCommand(&cobra.Command{Use: "agents", Short: "Reconfigure agent roles, models, effort, and command templates", RunE: configEditCommand})
+	rootCmd.AddCommand(editRoot)
 	rootCmd.AddCommand(&cobra.Command{Use: "history", Short: "List previous orchestration runs", RunE: historyCommand})
 	rootCmd.AddCommand(&cobra.Command{Use: "update", Short: "Check self-update status", RunE: func(*cobra.Command, []string) error {
 		fmt.Printf("paola %s is current; self-update provider is ready for GitHub releases.\n", version)
@@ -111,9 +116,15 @@ func configCommand(*cobra.Command, []string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// Explicit agent reconfiguration is also the compatibility point for older
+	// workspaces created before durable task-scoped sessions existed.
+	if strings.TrimSpace(c.SessionStrategy) == "" && !c.ReuseSessions {
+		c.SessionStrategy = "task"
+		c.ReuseSessions = true
+	}
 	fmt.Println("PAOLA CONFIG")
 	fmt.Println("────────────")
-	fmt.Printf("Project: %s\nRetries: %d\nIdle timeout: %d minutes\nSimulation: %t\nReuse sessions: %t\nTest: %s\n", c.ProjectName, c.EffectiveMaxRetries(), c.EffectiveIdleTimeoutMinutes(), c.Simulation, c.ReuseSessions, empty(c.TestCommand))
+	fmt.Printf("Project: %s\nRetries: %d\nIdle timeout: %d minutes\nSimulation: %t\nSession strategy: %s\nTest: %s\n", c.ProjectName, c.EffectiveMaxRetries(), c.EffectiveIdleTimeoutMinutes(), c.Simulation, c.EffectiveSessionStrategy(), empty(c.TestCommand))
 	fmt.Println("Role      CLI")
 	for _, role := range []string{"coder", "reviewer", "judge"} {
 		model := c.Models[role]
@@ -126,6 +137,127 @@ func configCommand(*cobra.Command, []string) error {
 	for n, p := range config.BinaryStatus(c) {
 		fmt.Printf("%-9s %s\n", n, p)
 	}
+	if err := config.Check(r); err != nil {
+		fmt.Println("Doctor: FAIL -", err)
+	} else {
+		fmt.Println("Doctor: OK")
+	}
+	return nil
+}
+
+func configEditCommand(*cobra.Command, []string) error {
+	r, err := root()
+	if err != nil {
+		return err
+	}
+	c, err := config.Load(r)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if c.Agents == nil {
+		c.Agents = map[string]string{}
+	}
+	if c.Models == nil {
+		c.Models = map[string]string{}
+	}
+	if c.Budgets == nil {
+		c.Budgets = map[string]config.RoleBudget{}
+	}
+	if c.Commands == nil {
+		c.Commands = map[string]config.AgentCommand{}
+	}
+
+	available := []string{}
+	for _, name := range []string{"agy", "codex", "claude"} {
+		if _, lookErr := exec.LookPath(name); lookErr == nil {
+			available = append(available, name)
+		}
+	}
+	// Keep currently configured CLIs selectable even if they are temporarily
+	// unavailable, so reconfiguration does not silently erase a role.
+	for _, role := range []string{"coder", "reviewer", "judge"} {
+		name := c.Agents[role]
+		if name != "" && !containsString(available, name) {
+			available = append(available, name)
+		}
+	}
+	if len(available) == 0 {
+		return fmt.Errorf("no supported agent CLI found; install agy, codex, or claude first")
+	}
+
+	roles := []string{"coder", "reviewer", "judge"}
+	selected := make(map[string]string, len(roles))
+	for _, role := range roles {
+		current := c.Agents[role]
+		if current == "" || !containsString(available, current) {
+			current = available[0]
+		}
+		options := make([]huh.Option[string], 0, len(available))
+		for _, name := range available {
+			label := name
+			if _, lookErr := exec.LookPath(name); lookErr != nil {
+				label += " (no instalado)"
+			}
+			options = append(options, huh.NewOption(label, name))
+		}
+		if err := huh.NewForm(huh.NewGroup(
+			huh.NewSelect[string]().Title("CLI para " + role).Options(options...).Value(&current),
+		).Title("PAOLA · Roles").Description("Selecciona el CLI que ejecutará este rol.")).Run(); err != nil {
+			return err
+		}
+		selected[role] = current
+		c.Agents[role] = current
+
+		model := c.Models[role]
+		if err := huh.NewForm(huh.NewGroup(
+			huh.NewInput().Title("Modelo para " + role + " (opcional)").Description("Vacío = modelo predeterminado del CLI.").Value(&model),
+		).Title("PAOLA · Modelos")).Run(); err != nil {
+			return err
+		}
+		c.Models[role] = strings.TrimSpace(model)
+
+		budget := c.Budget(role)
+		effort := budget.Effort
+		if err := huh.NewForm(huh.NewGroup(
+			huh.NewSelect[string]().Title("Esfuerzo para " + role).Options(huh.NewOptions("low", "medium", "high")...).Value(&effort),
+		).Title("PAOLA · Esfuerzo").Description("Controla el esfuerzo solicitado al agente cuando el CLI lo admite.")).Run(); err != nil {
+			return err
+		}
+		budget.Effort = effort
+		c.Budgets[role] = budget
+	}
+
+	refresh := true
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().Title("¿Actualizar plantillas de comando?").Description("Reemplaza las plantillas de los roles seleccionados por las compatibles con cada CLI y corrige opciones obsoletas.").Affirmative("Sí, actualizar").Negative("No, conservar").Value(&refresh),
+	).Title("PAOLA · Plantillas")).Run(); err != nil {
+		return err
+	}
+	if refresh {
+		for role, cli := range selected {
+			canonical, ok := config.DefaultAgentCommand(cli)
+			if !ok {
+				continue
+			}
+			commands := c.Commands[cli]
+			switch role {
+			case "coder":
+				commands.Coder = canonical.Coder
+			case "reviewer":
+				commands.Reviewer = canonical.Reviewer
+			case "judge":
+				commands.Judge = canonical.Judge
+			}
+			if canonical.SessionArgs != "" {
+				commands.SessionArgs = canonical.SessionArgs
+			}
+			c.Commands[cli] = commands
+		}
+	}
+	if err := config.Save(r, c); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	fmt.Println("PAOLA configuration updated: roles, models, effort, and selected command templates saved.")
 	if err := config.Check(r); err != nil {
 		fmt.Println("Doctor: FAIL -", err)
 	} else {
@@ -666,6 +798,9 @@ func renderHistoryReport(run paolahistory.Manifest) string {
 	fmt.Fprintf(&b, "Started    %s\n", formatTime(run.StartedAt))
 	fmt.Fprintf(&b, "Finished   %s\n", finished)
 	fmt.Fprintf(&b, "Iteration  %s\n", run.ID)
+	if run.ParentID != "" {
+		fmt.Fprintf(&b, "Resumed from %s\n", run.ParentID)
+	}
 	fmt.Fprintf(&b, "Tasks      %d · %d tokens · %d files\n", len(run.Tasks), totalTokens, totalFiles)
 
 	fmt.Fprintln(&b, "\nTIMELINE")
@@ -712,7 +847,17 @@ func renderHistoryReport(run paolahistory.Manifest) string {
 					if tokens == 0 {
 						tokenLabel = fmt.Sprintf("~%d tokens", metric.EstimatedTokens)
 					}
-					fmt.Fprintf(&b, "       %-10s %-8s · model: %s · effort: %s · turn %d · %s · %d/%d chars · %s · %s\n", key, metric.CLI, empty(metric.Model), empty(metric.Effort), metric.Turns, tokenLabel, metric.InputChars, metric.OutputChars, formatDuration(metric.Duration), strings.ToUpper(metric.Status))
+					contextLabel := metric.ContextMode
+					if contextLabel == "" {
+						contextLabel = "checkpoint"
+					}
+					if metric.SessionResumed {
+						contextLabel += ", resumed"
+					}
+					if metric.FallbackUsed {
+						contextLabel += ", fallback"
+					}
+					fmt.Fprintf(&b, "       %-10s %-8s · model: %s · effort: %s · turn %d · %s · %d/%d chars · %s · %s · %s\n", key, metric.CLI, empty(metric.Model), empty(metric.Effort), metric.Turns, tokenLabel, metric.InputChars, metric.OutputChars, formatDuration(metric.Duration), contextLabel, strings.ToUpper(metric.Status))
 					if metric.Error != "" {
 						fmt.Fprintf(&b, "       error: %s\n", metric.Error)
 					}
@@ -731,11 +876,31 @@ func renderHistoryReport(run paolahistory.Manifest) string {
 	} else {
 		fmt.Fprintln(&b, "○ Run is still in progress")
 	}
+	if len(run.Events) > 0 {
+		fmt.Fprintln(&b, "\nEVENT TRACE")
+		fmt.Fprintln(&b, "───────────")
+		for _, event := range run.Events {
+			label := event.Type
+			if event.Decision != "" {
+				label += " · " + event.Decision
+			}
+			if event.Role != "" {
+				label += " · " + event.Role
+			}
+			if event.Agent != "" {
+				label += " (" + event.Agent + ")"
+			}
+			if event.Error != "" {
+				label += " · error: " + event.Error
+			}
+			fmt.Fprintf(&b, "%02d · %s · task %d · %s\n", event.Sequence, formatTime(event.At), event.TaskIndex, label)
+		}
+	}
 
 	fmt.Fprintln(&b, "\nPARAMETERS")
 	fmt.Fprintln(&b, "──────────")
 	fmt.Fprintf(&b, "Retries    %d\n", run.Config.EffectiveMaxRetries())
-	fmt.Fprintf(&b, "Idle limit %d min · Simulation %t · Session reuse %t\n", run.Config.EffectiveIdleTimeoutMinutes(), run.Config.Simulation, run.Config.ReuseSessions)
+	fmt.Fprintf(&b, "Idle limit %d min · Simulation %t · Session strategy %s\n", run.Config.EffectiveIdleTimeoutMinutes(), run.Config.Simulation, run.Config.EffectiveSessionStrategy())
 	fmt.Fprintf(&b, "Test       %s\n", empty(run.Config.TestCommand))
 	for _, role := range []string{"coder", "reviewer", "judge"} {
 		cli := empty(run.Config.Agents[role])

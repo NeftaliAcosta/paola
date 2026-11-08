@@ -20,14 +20,38 @@ import (
 )
 
 type Manifest struct {
-	ID         string        `json:"id"`
-	TaskTitle  string        `json:"task_title"`
-	StartedAt  time.Time     `json:"started_at"`
-	FinishedAt *time.Time    `json:"finished_at,omitempty"`
-	Status     string        `json:"status"`
-	Project    string        `json:"project"`
-	Config     config.Config `json:"config"`
-	Tasks      []TaskRecord  `json:"tasks,omitempty"`
+	SchemaVersion int           `json:"schema_version,omitempty"`
+	ID            string        `json:"id"`
+	ParentID      string        `json:"parent_execution_id,omitempty"`
+	TaskTitle     string        `json:"task_title"`
+	StartedAt     time.Time     `json:"started_at"`
+	FinishedAt    *time.Time    `json:"finished_at,omitempty"`
+	Status        string        `json:"status"`
+	Project       string        `json:"project"`
+	Config        config.Config `json:"config"`
+	Tasks         []TaskRecord  `json:"tasks,omitempty"`
+	Events        []Event       `json:"events,omitempty"`
+}
+
+// Event is an append-only audit record for one orchestration transition.
+// It intentionally stores references to encrypted transcripts instead of
+// duplicating agent output in the manifest.
+type Event struct {
+	ID          string    `json:"id"`
+	Sequence    int       `json:"sequence"`
+	ExecutionID string    `json:"execution_id"`
+	TaskIndex   int       `json:"task_index,omitempty"`
+	Task        string    `json:"task,omitempty"`
+	Attempt     int       `json:"attempt,omitempty"`
+	Role        string    `json:"role,omitempty"`
+	Agent       string    `json:"agent,omitempty"`
+	Type        string    `json:"type"`
+	Status      string    `json:"status,omitempty"`
+	Decision    string    `json:"decision,omitempty"`
+	Error       string    `json:"error,omitempty"`
+	OutputRef   string    `json:"output_ref,omitempty"`
+	Evidence    []string  `json:"evidence,omitempty"`
+	At          time.Time `json:"at"`
 }
 type TaskRecord struct {
 	Index        int                    `json:"index"`
@@ -60,6 +84,9 @@ type AgentMetric struct {
 	Retryable       bool          `json:"retryable,omitempty"`
 	Error           string        `json:"error,omitempty"`
 	SessionID       string        `json:"session_id,omitempty"`
+	ContextMode     string        `json:"context_mode,omitempty"`
+	SessionResumed  bool          `json:"session_resumed,omitempty"`
+	FallbackUsed    bool          `json:"session_fallback_used,omitempty"`
 }
 type Recorder struct {
 	root     string
@@ -80,10 +107,18 @@ func Start(root string, c config.Config) (*Recorder, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "logs", "tasks"), 0755); err != nil {
 		return nil, err
 	}
-	r := &Recorder{root: root, key: key, dir: dir, manifest: Manifest{ID: id, TaskTitle: nonEmpty(c.TaskTitle, "Untitled task"), StartedAt: now, Status: "running", Project: c.ProjectName, Config: c}}
+	r := &Recorder{root: root, key: key, dir: dir, manifest: Manifest{SchemaVersion: 2, ID: id, TaskTitle: nonEmpty(c.TaskTitle, "Untitled task"), StartedAt: now, Status: "running", Project: c.ProjectName, Config: c}}
 	return r, r.save()
 }
 func (r *Recorder) ID() string { return r.manifest.ID }
+
+// SetParentExecution links a resumed run to the prior execution without
+// mutating the prior encrypted manifest. A new manifest remains the durable
+// boundary for every invocation, while the lineage stays queryable.
+func (r *Recorder) SetParentExecution(id string) error {
+	r.manifest.ParentID = strings.TrimSpace(id)
+	return r.save()
+}
 func (r *Recorder) save() error {
 	b, err := json.MarshalIndent(r.manifest, "", "  ")
 	if err != nil {
@@ -122,6 +157,23 @@ func (r *Recorder) UpdateTaskMetrics(index int, metrics map[string]AgentMetric) 
 	}
 	return nil
 }
+
+// Event appends one durable audit event and immediately persists the
+// manifest. A failed write is returned to the caller so orchestration cannot
+// silently continue with incomplete audit evidence.
+func (r *Recorder) Event(event Event) error {
+	event.Sequence = len(r.manifest.Events) + 1
+	if event.At.IsZero() {
+		event.At = time.Now().UTC()
+	}
+	if event.ExecutionID == "" {
+		event.ExecutionID = r.manifest.ID
+	}
+	event.ID = fmt.Sprintf("%s-%06d", r.manifest.ID, event.Sequence)
+	event.Error = trimError(event.Error)
+	r.manifest.Events = append(r.manifest.Events, event)
+	return r.save()
+}
 func (r *Recorder) Finish(status string) error {
 	return r.FinishWithError(status, "")
 }
@@ -146,10 +198,19 @@ func (r *Recorder) FinishWithError(status, errorText string) error {
 	return r.save()
 }
 func (r *Recorder) Log(taskIndex int, role, output string) error {
+	return r.LogAttempt(taskIndex, 0, role, output)
+}
+
+// LogAttempt keeps every role transcript, including repeated attempts.
+func (r *Recorder) LogAttempt(taskIndex, attempt int, role, output string) error {
 	if strings.TrimSpace(output) == "" {
 		return nil
 	}
-	p := filepath.Join(r.dir, "logs", "tasks", fmt.Sprintf("%03d-%s.enc", taskIndex, role))
+	suffix := role
+	if attempt > 0 {
+		suffix = fmt.Sprintf("attempt-%02d-%s", attempt, role)
+	}
+	p := filepath.Join(r.dir, "logs", "tasks", fmt.Sprintf("%03d-%s.enc", taskIndex, suffix))
 	return writeEncrypted(p, r.key, []byte(output))
 }
 func (r *Recorder) Diff(taskIndex int, diff string) error {
@@ -178,6 +239,11 @@ func List(root string) ([]Manifest, error) {
 		if err == nil {
 			var m Manifest
 			if json.Unmarshal(b, &m) == nil && len(m.Tasks) > 0 {
+				if migrateLegacy(&m) {
+					if updated, marshalErr := json.MarshalIndent(m, "", "  "); marshalErr == nil {
+						_ = writeEncrypted(path, key, updated)
+					}
+				}
 				out = append(out, m)
 			}
 		}
@@ -187,6 +253,58 @@ func List(root string) ([]Manifest, error) {
 		return nil, nil
 	}
 	return out, err
+}
+
+func migrateLegacy(m *Manifest) bool {
+	if m.SchemaVersion >= 2 && len(m.Events) > 0 {
+		return false
+	}
+	if m.SchemaVersion == 0 {
+		m.SchemaVersion = 2
+	}
+	if len(m.Events) > 0 {
+		return true
+	}
+	sequence := 0
+	add := func(taskIndex int, task, eventType, status, errText string, at time.Time) {
+		sequence++
+		m.Events = append(m.Events, Event{ID: fmt.Sprintf("%s-%06d", m.ID, sequence), Sequence: sequence, ExecutionID: m.ID, TaskIndex: taskIndex, Task: task, Type: eventType, Status: status, Error: trimError(errText), At: at})
+	}
+	add(0, "", "execution_started", "running", "", m.StartedAt)
+	for _, task := range m.Tasks {
+		add(task.Index, task.Description, "task_started", "running", "", task.StartedAt)
+		for _, role := range []string{"coder", "reviewer", "judge"} {
+			metric, ok := task.Metrics[role]
+			if !ok {
+				continue
+			}
+			add(task.Index, task.Description, "agent_summary", metric.Status, metric.Error, task.FinishedAt)
+			m.Events[len(m.Events)-1].Role = role
+			m.Events[len(m.Events)-1].Agent = metric.CLI
+		}
+		status := task.Status
+		if status == "" {
+			status = "unknown"
+		}
+		add(task.Index, task.Description, "task_finished", status, task.Error, task.FinishedAt)
+	}
+	add(0, "", "execution_finished", m.Status, "", valueTime(m.FinishedAt, m.StartedAt))
+	return true
+}
+
+func valueTime(value *time.Time, fallback time.Time) time.Time {
+	if value != nil {
+		return *value
+	}
+	return fallback
+}
+
+func trimError(value string) string {
+	value = strings.ToValidUTF8(strings.TrimSpace(value), "�")
+	if len(value) > 2000 {
+		return value[:2000] + "…"
+	}
+	return value
 }
 func Load(root, id string) (Manifest, error) {
 	runs, err := List(root)

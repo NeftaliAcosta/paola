@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -73,15 +74,40 @@ func (c *Control) Wait(ctx context.Context) error {
 }
 
 type Engine struct {
-	Root       string
-	Config     config.Config
-	Runner     agent.AgentRunner
-	Log        LogFunc
-	Update     ProgressFunc
-	Control    *Control
-	TaskBranch string
-	BaseBranch string
-	Sessions   map[string]string
+	Root        string
+	Config      config.Config
+	Runner      agent.AgentRunner
+	Log         LogFunc
+	Update      ProgressFunc
+	Control     *Control
+	TaskBranch  string
+	BaseBranch  string
+	ExecutionID string
+	Sessions    map[string]string
+}
+
+type taskCheckpoint struct {
+	Task        string            `json:"task"`
+	TaskIndex   int               `json:"task_index"`
+	Attempt     int               `json:"attempt"`
+	Stage       string            `json:"stage"`
+	Status      string            `json:"status"`
+	NextAction  string            `json:"next_action,omitempty"`
+	Files       []string          `json:"files,omitempty"`
+	TestStatus  string            `json:"test_status,omitempty"`
+	SessionKeys map[string]string `json:"session_keys,omitempty"`
+	UpdatedAt   time.Time         `json:"updated_at"`
+}
+
+func checkpointIsContinuation(raw string) bool {
+	var cp taskCheckpoint
+	if json.Unmarshal([]byte(raw), &cp) != nil {
+		return false
+	}
+	// The first coder turn is prepared with a checkpoint too, but it must
+	// receive the complete project context. Every later stage/attempt can use
+	// the compact checkpoint packet instead.
+	return cp.Attempt > 1 || (cp.Stage != "" && cp.Stage != "coder")
 }
 
 func (e *Engine) emit(s string) {
@@ -98,10 +124,20 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 	}
 	lines := strings.Split(string(b), "\n")
 	state, _ := config.LoadState(e.Root)
+	previousExecution := state.ExecutionID
+	if state.Status == "complete" {
+		previousExecution = ""
+	}
 	if e.Sessions == nil {
 		e.Sessions = state.Sessions
 	}
 	if e.Sessions == nil {
+		e.Sessions = map[string]string{}
+	}
+	// A completed workspace starts a new execution namespace. Do not carry
+	// provider sessions from an older run into it; those sessions may be stale
+	// and can contain unrelated task context.
+	if previousExecution == "" {
 		e.Sessions = map[string]string{}
 	}
 	maxRetries := e.maxRetries()
@@ -115,7 +151,22 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return err
 	}
+	if previousExecution != "" {
+		e.ExecutionID = previousExecution
+		if err := record.SetParentExecution(previousExecution); err != nil {
+			return err
+		}
+	} else {
+		e.ExecutionID = record.ID()
+	}
+	state.ExecutionID = e.ExecutionID
+	if err := record.Event(history.Event{Type: "execution_started", Status: "running"}); err != nil {
+		return err
+	}
 	runStatus := "failed"
+	activeTaskIndex := 0
+	activeTask := ""
+	activeTaskFinished := false
 	promptPath := filepath.Join(e.Root, config.Dir, "state", "current_prompt.md")
 	_ = os.Remove(promptPath)
 	defer func() { _ = os.Remove(promptPath) }()
@@ -127,17 +178,36 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			state.Status = "interrupted"
 			_ = config.SaveState(e.Root, state)
 		}
-		_ = record.FinishWithError(runStatus, errorText(runErr))
+		if runErr != nil && activeTaskIndex > 0 && !activeTaskFinished {
+			_ = record.Event(history.Event{TaskIndex: activeTaskIndex, Task: activeTask, Type: "task_finished", Status: "failed", Error: summarizeAgentError(errorText(runErr))})
+		}
+		status := runStatus
+		if runErr != nil && status == "failed" && ctx.Err() != nil {
+			status = "interrupted"
+		}
+		_ = record.Event(history.Event{Type: "execution_finished", Status: status, Error: auditError(runErr)})
+		_ = record.FinishWithError(status, errorText(runErr))
 	}()
 	if state.Status == "" {
 		state.Status = "running"
 	}
 	for ordinal, idx := range indexes {
 		task := gitutil.CleanTask(lines[idx])
+		activeTaskIndex = ordinal + 1
+		activeTask = task
+		activeTaskFinished = false
 		_ = os.Remove(promptPath)
-		_ = record.RecordTask(history.TaskRecord{Index: ordinal + 1, Description: task, Status: "running", StartedAt: time.Now().UTC()})
+		startedAt := time.Now().UTC()
+		if err := record.RecordTask(history.TaskRecord{Index: ordinal + 1, Description: task, Status: "running", StartedAt: startedAt}); err != nil {
+			return err
+		}
+		if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Type: "task_started", Status: "running"}); err != nil {
+			return err
+		}
 		state.CurrentTask = ordinal
 		state.Attempt = 0
+		taskBase, _ := gitutil.Head(e.Root)
+		taskKey := fmt.Sprintf("task-%03d", ordinal+1)
 		state.Status = "running"
 		if err := config.SaveState(e.Root, state); err != nil {
 			return err
@@ -150,6 +220,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 
 		completed := false
 		reviewRounds := 0
+		testStatus := "not_run"
 		metrics := map[string]history.AgentMetric{}
 		turns := map[string]int{}
 		for !completed {
@@ -158,6 +229,10 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 			if e.Control != nil && e.Control.ConsumeSkip() {
 				e.emit("↷ skipped: " + task)
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "task_finished", Status: "skipped"}); err != nil {
+					return err
+				}
+				activeTaskFinished = true
 				break
 			}
 			state.Attempt++
@@ -166,14 +241,29 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 			coder := e.Config.Agents["coder"]
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Coder", coder, "")
-			prompt, _ := e.prompt("coder", task)
+			_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "coder", Status: "running", NextAction: "coder turn", SessionKeys: e.taskSessions(taskKey)})
+			prompt, _ := e.prompt("coder", task, taskKey)
 			_ = os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "current_prompt.md"), []byte(prompt), 0600)
 			e.emit(fmt.Sprintf("Coder attempt %d/%d (%s)", state.Attempt, maxRetries, coder))
-			coderOutput, err := e.runRole(ctx, "coder", prompt, turns, metrics)
-			_ = record.Log(ordinal+1, "coder", coderOutput)
+			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "coder", Agent: coder, Type: "agent_started", Status: "running"}); err != nil {
+				return err
+			}
+			coderOutput, err := e.runRole(ctx, "coder", prompt, taskKey, turns, metrics)
+			_ = e.saveSessionState()
+			_ = record.LogAttempt(ordinal+1, state.Attempt, "coder", coderOutput)
+			coderStatus := "completed"
+			if err != nil {
+				coderStatus = "failed"
+			}
+			if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "coder", Agent: coder, Type: "agent_finished", Status: coderStatus, Error: auditError(err), OutputRef: fmt.Sprintf("logs/tasks/%03d-attempt-%02d-coder.enc", ordinal+1, state.Attempt)}); eventErr != nil {
+				return eventErr
+			}
 			if err != nil {
 				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
 				if retryableError(err) && state.Attempt < maxRetries {
+					if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "coder", Agent: coder, Type: "retry_scheduled", Status: "retrying", Error: auditError(err)}); eventErr != nil {
+						return eventErr
+					}
 					e.emit(fmt.Sprintf("Retryable coder failure; retrying in %ds", e.Config.EffectiveRetryBackoffSeconds()))
 					if err := waitBackoff(ctx, e.Config.EffectiveRetryBackoffSeconds()); err != nil {
 						return err
@@ -184,21 +274,38 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 
 			if e.Config.TestCommand != "" {
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_started", Status: "running", Evidence: []string{"state/test_output.log"}}); err != nil {
+					return err
+				}
+				_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "running", NextAction: "validation", SessionKeys: e.taskSessions(taskKey)})
 				testOut, testErr := runTest(ctx, e.Root, e.Config.TestCommand)
 				if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "test_output.log"), []byte(testOut), 0644); err != nil {
 					return err
 				}
 				if testErr != nil {
+					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_finished", Status: "failed", Error: auditError(testErr), Evidence: []string{"state/test_output.log"}}); err != nil {
+						return err
+					}
+					testStatus = "failed"
+					_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "failed", TestStatus: testStatus, NextAction: "coder correction", SessionKeys: e.taskSessions(taskKey)})
 					if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(testOut), 0644); err != nil {
 						return err
 					}
 					e.emit("Tests failed; returning to Coder")
+					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "retry_scheduled", Status: "retrying", Error: auditError(testErr), Evidence: []string{"state/test_output.log"}}); err != nil {
+						return err
+					}
 					_ = writeContextSummary(e.Root, task, metrics)
 					if state.Attempt >= maxRetries {
 						return fmt.Errorf("tests failed after %d attempts", state.Attempt)
 					}
 					continue
 				}
+				testStatus = "passed"
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_finished", Status: "passed", Evidence: []string{"state/test_output.log"}}); err != nil {
+					return err
+				}
+				_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "completed", TestStatus: testStatus, NextAction: "review diff", SessionKeys: e.taskSessions(taskKey)})
 			}
 
 			diff := ""
@@ -206,7 +313,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				diff = "SIMULATION: no project diff captured.\n"
 			} else {
 				var diffErr error
-				diff, diffErr = gitutil.CaptureDiff(e.Root)
+				diff, diffErr = gitutil.CaptureDiffSince(e.Root, taskBase)
 				if diffErr != nil {
 					return fmt.Errorf("capture Git diff for task %q: %w", task, diffErr)
 				}
@@ -221,14 +328,29 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			reviewer := e.Config.Agents["reviewer"]
 			reviewRounds++
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Reviewer", reviewer, "")
-			reviewPrompt, _ := e.prompt("reviewer", task)
+			_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "reviewer", Status: "running", TestStatus: testStatus, NextAction: "review diff", Files: gitutil.ChangedFilesSince(e.Root, taskBase), SessionKeys: e.taskSessions(taskKey)})
+			reviewPrompt, _ := e.prompt("reviewer", task, taskKey)
 			e.emit("Reviewer (" + reviewer + ")")
+			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "agent_started", Status: "running", Evidence: []string{fmt.Sprintf("diffs/task-%03d.patch.enc", ordinal+1)}}); err != nil {
+				return err
+			}
 			reviewInput := e.limitRoleInput("reviewer", reviewPrompt+"\nCURRENT DIFF:\n"+diff)
-			review, err := e.runRole(ctx, "reviewer", reviewInput, turns, metrics)
-			_ = record.Log(ordinal+1, "reviewer", review)
+			review, err := e.runRole(ctx, "reviewer", reviewInput, taskKey, turns, metrics)
+			_ = e.saveSessionState()
+			_ = record.LogAttempt(ordinal+1, state.Attempt, "reviewer", review)
+			reviewerStatus := "completed"
+			if err != nil {
+				reviewerStatus = "failed"
+			}
+			if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "agent_finished", Status: reviewerStatus, Error: auditError(err), OutputRef: fmt.Sprintf("logs/tasks/%03d-attempt-%02d-reviewer.enc", ordinal+1, state.Attempt)}); eventErr != nil {
+				return eventErr
+			}
 			if err != nil {
 				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
 				if retryableError(err) && state.Attempt < maxRetries {
+					if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "retry_scheduled", Status: "retrying", Error: auditError(err)}); eventErr != nil {
+						return eventErr
+					}
 					e.emit(fmt.Sprintf("Retryable reviewer failure; retrying in %ds", e.Config.EffectiveRetryBackoffSeconds()))
 					if err := waitBackoff(ctx, e.Config.EffectiveRetryBackoffSeconds()); err != nil {
 						return err
@@ -240,12 +362,24 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(review), 0644); err != nil {
 				return err
 			}
+			decisionRecorded := "STATUS: CHANGES_REQUESTED"
+			decisionStatus := "changes_requested"
 			if hasMarker(review, "STATUS: LGTM") {
+				decisionRecorded = "STATUS: LGTM"
+				decisionStatus = "approved"
+			}
+			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "review_decision", Status: decisionStatus, Decision: decisionRecorded}); err != nil {
+				return err
+			}
+			if decisionStatus == "approved" {
 				completed = true
 				e.emit("✓ reviewer approved")
 				break
 			}
 			if state.Attempt < maxRetries {
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "retry_scheduled", Status: "retrying", Error: "reviewer requested changes"}); err != nil {
+					return err
+				}
 				e.emit("Reviewer requested changes")
 				_ = writeContextSummary(e.Root, task, metrics)
 				continue
@@ -253,11 +387,23 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 
 			judge := e.Config.Agents["judge"]
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Judge", judge, "")
-			judgePrompt, _ := e.prompt("judge", task)
+			_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "judge", Status: "running", NextAction: "resolve review disagreement", Files: gitutil.ChangedFilesSince(e.Root, taskBase), SessionKeys: e.taskSessions(taskKey)})
+			judgePrompt, _ := e.prompt("judge", task, taskKey)
 			e.emit("Judge (" + judge + ")")
+			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "judge", Agent: judge, Type: "agent_started", Status: "running"}); err != nil {
+				return err
+			}
 			judgeInput := e.limitRoleInput("judge", judgePrompt+"\nREVIEW:\n"+review+"\nCURRENT DIFF:\n"+diff)
-			verdict, err := e.runRole(ctx, "judge", judgeInput, turns, metrics)
-			_ = record.Log(ordinal+1, "judge", verdict)
+			verdict, err := e.runRole(ctx, "judge", judgeInput, taskKey, turns, metrics)
+			_ = e.saveSessionState()
+			_ = record.LogAttempt(ordinal+1, state.Attempt, "judge", verdict)
+			judgeStatus := "completed"
+			if err != nil {
+				judgeStatus = "failed"
+			}
+			if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "judge", Agent: judge, Type: "agent_finished", Status: judgeStatus, Error: auditError(err), OutputRef: fmt.Sprintf("logs/tasks/%03d-attempt-%02d-judge.enc", ordinal+1, state.Attempt)}); eventErr != nil {
+				return eventErr
+			}
 			if err != nil {
 				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
 				return err
@@ -266,6 +412,9 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return err
 			}
 			if hasMarker(verdict, "VERDICT: OVERRIDE_APPROVE") {
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "judge", Agent: judge, Type: "judge_decision", Status: "approved", Decision: "VERDICT: OVERRIDE_APPROVE"}); err != nil {
+					return err
+				}
 				completed = true
 				e.emit("✓ judge approved")
 				break
@@ -273,16 +422,23 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			if !hasMarker(verdict, "VERDICT: FINAL_INSTRUCTIONS") {
 				return fmt.Errorf("judge returned no recognized verdict for task %q", task)
 			}
+			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "judge", Agent: judge, Type: "judge_decision", Status: "final_instructions", Decision: "VERDICT: FINAL_INSTRUCTIONS"}); err != nil {
+				return err
+			}
 			// The Judge's synthesis becomes feedback for exactly one final Coder turn.
 			e.emit("Judge issued final instructions; starting bonus Coder turn")
 			if err := e.wait(ctx); err != nil {
 				return err
 			}
 			state.Attempt++
-			coderPrompt, _ := e.prompt("coder", task)
+			coderPrompt, _ := e.prompt("coder", task, taskKey)
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Coder (bonus)", coder, "FINAL_INSTRUCTIONS")
-			bonusOutput, err := e.runRole(ctx, "coder", coderPrompt, turns, metrics)
-			_ = record.Log(ordinal+1, "coder-bonus", bonusOutput)
+			bonusOutput, err := e.runRole(ctx, "coder", coderPrompt, taskKey, turns, metrics)
+			_ = e.saveSessionState()
+			_ = record.LogAttempt(ordinal+1, state.Attempt, "coder-bonus", bonusOutput)
+			if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "coder", Agent: coder, Type: "bonus_coder_finished", Status: statusFromError(err), Error: auditError(err), OutputRef: fmt.Sprintf("logs/tasks/%03d-attempt-%02d-coder-bonus.enc", ordinal+1, state.Attempt)}); eventErr != nil {
+				return eventErr
+			}
 			if err != nil {
 				_ = record.UpdateTaskMetrics(ordinal+1, metrics)
 				return fmt.Errorf("final coder turn failed: %w", err)
@@ -296,7 +452,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 					return fmt.Errorf("final coder tests failed: %w", testErr)
 				}
 			}
-			finalDiff, err := gitutil.CaptureDiff(e.Root)
+			finalDiff, err := gitutil.CaptureDiffSince(e.Root, taskBase)
 			if err != nil {
 				return err
 			}
@@ -308,9 +464,18 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			e.emit("✓ final coder turn complete")
 		}
 		if completed {
-			_ = record.UpdateTask(ordinal+1, "completed", "", taskTokenCount(e.Root, metrics), gitutil.ChangedFiles(e.Root), state.Attempt, reviewRounds)
-			_ = record.UpdateTaskMetrics(ordinal+1, metrics)
+			if err := record.UpdateTask(ordinal+1, "completed", "", taskTokenCount(e.Root, metrics), gitutil.ChangedFilesSince(e.Root, taskBase), state.Attempt, reviewRounds); err != nil {
+				return err
+			}
+			if err := record.UpdateTaskMetrics(ordinal+1, metrics); err != nil {
+				return err
+			}
+			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "task_finished", Status: "completed", Evidence: gitutil.ChangedFilesSince(e.Root, taskBase)}); err != nil {
+				return err
+			}
+			activeTaskFinished = true
 			_ = writeContextSummary(e.Root, task, metrics)
+			_ = e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "completed", Status: "completed", NextAction: "next roadmap task", Files: gitutil.ChangedFilesSince(e.Root, taskBase), SessionKeys: e.taskSessions(taskKey)})
 			_ = os.Remove(promptPath)
 			if !e.Config.Simulation {
 				if err := completeTask(e.Root, roadmapPath, lines, idx, task, state); err != nil {
@@ -357,15 +522,26 @@ func (e *Engine) progress(tasks []Task, current, ordinal, attempt int, role, cli
 	e.Update(Progress{Project: e.Config.ProjectName, Tasks: copyTasks, CurrentTask: ordinal, TotalTasks: len(copyTasks), Attempt: attempt, MaxRetries: e.maxRetries(), Role: role, CLI: cli, RoleAgents: e.Config.Agents, Verdict: verdict, Paused: e.Control != nil && e.Control.IsPaused()})
 }
 
-func (e *Engine) prompt(role, task string) (string, error) {
+func (e *Engine) prompt(role, task, taskKey string) (string, error) {
 	read := func(n string) string { b, _ := os.ReadFile(filepath.Join(e.Root, config.Dir, n)); return string(b) }
 	rolePrompt := read("roles/" + role + ".md")
 	rules := limitText(read("GOLDEN_RULES.md"), 10000)
 	summary := limitText(read("state/context_summary.md"), 6000)
 	feedback := limitText(read("state/feedback.md"), 10000)
 	contextText := limitText(read("CONTEXT.md"), 12000)
+	checkpoint := e.readCheckpoint(taskKey)
 	if summary == "" {
 		summary = "No previous task summary."
+	}
+	// A resumed provider session already owns the static conversation context.
+	// Send only the task delta and durable checkpoint instead of replaying the
+	// entire project context on every retry. Providers without resume still get
+	// the compact checkpoint and current evidence, but not historical logs.
+	if e.providerSession(taskKey, role) != "" || checkpointIsContinuation(checkpoint) {
+		rolePrompt = "Continue the existing task session. Preserve prior decisions unless new evidence invalidates them."
+		contextText = "Use the existing session plus the task checkpoint. Do not reread unrelated history."
+		rules = limitText(rules, 1500)
+		feedback = limitText(feedback, 5000)
 	}
 	switch role {
 	case "reviewer":
@@ -375,7 +551,7 @@ func (e *Engine) prompt(role, task string) (string, error) {
 		contextText = "Resolve only the reviewer disagreement using the task evidence and current diff."
 		rules = limitText(rules, 2500)
 	}
-	prompt := fmt.Sprintf("ROLE:\n%s\nCONTEXT:\n%s\nRULES:\n%s\nTASK:\n%s\nSUMMARY:\n%s\nFEEDBACK:\n%s", rolePrompt, contextText, rules, task, summary, feedback)
+	prompt := fmt.Sprintf("ROLE:\n%s\nCONTEXT:\n%s\nRULES:\n%s\nTASK:\n%s\nSUMMARY:\n%s\nCHECKPOINT:\n%s\nFEEDBACK:\n%s", rolePrompt, contextText, rules, task, summary, checkpoint, feedback)
 	budget := e.budget(role)
 	maxChars := budget.MaxInputChars
 	if budget.MaxInputTokens > 0 && budget.MaxInputTokens*4 < maxChars {
@@ -395,7 +571,7 @@ func (e *Engine) limitRoleInput(role, value string) string {
 	return limitText(value, maxChars)
 }
 
-func (e *Engine) runRole(ctx context.Context, role, prompt string, turns map[string]int, metrics map[string]history.AgentMetric) (string, error) {
+func (e *Engine) runRole(ctx context.Context, role, prompt, taskKey string, turns map[string]int, metrics map[string]history.AgentMetric) (string, error) {
 	budget := e.budget(role)
 	turns[role]++
 	if budget.MaxTurns > 0 && turns[role] > budget.MaxTurns {
@@ -403,19 +579,40 @@ func (e *Engine) runRole(ctx context.Context, role, prompt string, turns map[str
 	}
 	started := time.Now()
 	roleCtx := agent.WithEffort(ctx, budget.Effort)
-	if e.Config.ReuseSessions {
-		roleCtx = agent.WithSession(roleCtx, e.Sessions[role])
-		roleCtx = agent.WithSessionTemplate(roleCtx, e.Config.Commands[e.Config.Agents[role]].SessionArgs)
+	providerSessionID := ""
+	contextMode := "checkpoint"
+	sessionResumed := false
+	fallbackUsed := false
+	if e.Config.SessionsEnabled() {
+		providerSessionID = e.Sessions[e.sessionKey(taskKey, role)]
+		roleCtx = agent.WithSession(roleCtx, providerSessionID)
+		sessionTemplate := e.sessionTemplate(e.Config.Agents[role])
+		roleCtx = agent.WithSessionTemplate(roleCtx, sessionTemplate)
+		if providerSessionID != "" && strings.TrimSpace(sessionTemplate) != "" {
+			contextMode = "session_resume"
+			sessionResumed = true
+		}
 	}
 	rawOutput, err := e.runAgent(roleCtx, role, prompt)
+	if err != nil && providerSessionID != "" && isSessionResumeFailure(err) {
+		// Session IDs can expire or become incompatible after a CLI update. Do
+		// not burn the whole task: start one clean provider turn using the
+		// durable checkpoint already embedded in the compact prompt.
+		e.emit(fmt.Sprintf("Session %s unavailable; starting a fresh %s turn from checkpoint", providerSessionID, role))
+		freshCtx := agent.WithSessionTemplate(agent.WithSession(roleCtx, ""), "")
+		rawOutput, err = e.runAgent(freshCtx, role, prompt)
+		contextMode = "checkpoint_fallback"
+		sessionResumed = false
+		fallbackUsed = true
+	}
 	maxOutputChars := budget.MaxOutputChars
 	if budget.MaxOutputTokens > 0 && budget.MaxOutputTokens*4 < maxOutputChars {
 		maxOutputChars = budget.MaxOutputTokens * 4
 	}
 	output := limitOutput(rawOutput, maxOutputChars)
-	if e.Config.ReuseSessions {
+	if e.Config.SessionsEnabled() {
 		if session := extractSessionID(output); session != "" {
-			e.Sessions[role] = session
+			e.Sessions[e.sessionKey(taskKey, role)] = session
 		}
 	}
 	key := role
@@ -430,8 +627,97 @@ func (e *Engine) runRole(ctx context.Context, role, prompt string, turns map[str
 		e.emit("✗ " + message)
 	}
 	inputTokens, outputTokens := parseTokenMetrics(rawOutput)
-	metrics[key] = history.AgentMetric{Role: role, CLI: e.Config.Agents[role], Model: e.Config.Models[role], Effort: budget.Effort, Turns: turns[role], InputChars: len(prompt), OutputChars: len(rawOutput), InputTokens: inputTokens, OutputTokens: outputTokens, EstimatedTokens: estimateTokens(prompt) + estimateTokens(rawOutput), Duration: time.Since(started), Status: status, Retryable: retryableError(err), Error: errorText(err), SessionID: e.Sessions[role]}
+	metrics[key] = history.AgentMetric{Role: role, CLI: e.Config.Agents[role], Model: e.Config.Models[role], Effort: budget.Effort, Turns: turns[role], InputChars: len(prompt), OutputChars: len(rawOutput), InputTokens: inputTokens, OutputTokens: outputTokens, EstimatedTokens: estimateTokens(prompt) + estimateTokens(rawOutput), Duration: time.Since(started), Status: status, Retryable: retryableError(err), Error: errorText(err), SessionID: e.Sessions[e.sessionKey(taskKey, role)], ContextMode: contextMode, SessionResumed: sessionResumed, FallbackUsed: fallbackUsed}
 	return output, err
+}
+
+func (e *Engine) sessionKey(taskKey, role string) string {
+	return e.ExecutionID + "/" + taskKey + "/" + role
+}
+
+func (e *Engine) taskSessions(taskKey string) map[string]string {
+	out := map[string]string{}
+	for _, role := range []string{"coder", "reviewer", "judge"} {
+		if id := e.Sessions[e.sessionKey(taskKey, role)]; id != "" {
+			out[role] = id
+		}
+	}
+	return out
+}
+
+func (e *Engine) providerSession(taskKey, role string) string {
+	if !e.Config.SessionsEnabled() {
+		return ""
+	}
+	cli := e.Config.Agents[role]
+	if strings.TrimSpace(e.sessionTemplate(cli)) == "" {
+		return ""
+	}
+	return e.Sessions[e.sessionKey(taskKey, role)]
+}
+
+func (e *Engine) sessionTemplate(cli string) string {
+	if command := e.Config.Commands[cli]; strings.TrimSpace(command.SessionArgs) != "" {
+		return command.SessionArgs
+	}
+	// Older workspaces do not have session_args in config.yaml. Resolve the
+	// built-in adapter without mutating the user's faithfully loaded config.
+	if command, ok := config.DefaultAgentCommand(cli); ok {
+		return command.SessionArgs
+	}
+	return ""
+}
+
+func (e *Engine) saveSessionState() error {
+	state, err := config.LoadState(e.Root)
+	if err != nil {
+		return err
+	}
+	state.Sessions = e.Sessions
+	return config.SaveState(e.Root, state)
+}
+
+func (e *Engine) checkpointPath(taskKey string) string {
+	return filepath.Join(e.Root, config.Dir, "state", "checkpoints", taskKey+".json")
+}
+
+func (e *Engine) saveCheckpoint(cp taskCheckpoint) error {
+	if err := os.MkdirAll(filepath.Dir(e.checkpointPath(fmt.Sprintf("task-%03d", cp.TaskIndex))), 0755); err != nil {
+		return err
+	}
+	cp.UpdatedAt = time.Now().UTC()
+	b, err := json.MarshalIndent(cp, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(e.checkpointPath(fmt.Sprintf("task-%03d", cp.TaskIndex)), b, 0600)
+}
+
+func (e *Engine) readCheckpoint(taskKey string) string {
+	b, err := os.ReadFile(e.checkpointPath(taskKey))
+	if err != nil {
+		return "No durable checkpoint for this task."
+	}
+	return limitText(string(b), 5000)
+}
+
+func isSessionResumeFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	failure := []string{"not found", "unknown", "invalid", "expired", "failed", "unsupported", "unavailable", "does not exist"}
+	for _, marker := range []string{"session", "resume", "thread", "conversation"} {
+		if !strings.Contains(lower, marker) {
+			continue
+		}
+		for _, reason := range failure {
+			if strings.Contains(lower, reason) {
+				return true
+			}
+		}
+	}
+	return strings.Contains(lower, "could not resume") || strings.Contains(lower, "cannot resume")
 }
 
 var sessionIDRE = regexp.MustCompile(`(?i)(?:session[_ -]?id|sessionId|thread[_ -]?id|conversation[_ -]?id)\s*[=:]\s*["']?([a-z0-9-]{16,})`)
@@ -479,10 +765,37 @@ func retryableError(err error) bool {
 }
 
 func retryableText(value string) bool {
-	lower := strings.ToLower(value)
-	for _, marker := range []string{"429", "rate limit", "rate_limit", "quota", "capacity", "too many requests", "temporarily unavailable", "timeout", "timed out", "connection reset", "resource exhausted", "usage limit", "context window exceeded"} {
-		if strings.Contains(lower, marker) {
+	for _, rawLine := range strings.Split(value, "\n") {
+		line := strings.ToLower(strings.TrimSpace(rawLine))
+		if line == "" {
+			continue
+		}
+		// Agent output often contains valid prose mentioning capacity, limits,
+		// or restrictions. Only classify explicit failure-shaped lines as
+		// retryable; otherwise a successful report can be retried incorrectly.
+		if strings.Contains(line, "429") ||
+			strings.Contains(line, "rate limit exceeded") ||
+			strings.Contains(line, "rate_limit_exceeded") ||
+			strings.Contains(line, "too many requests") ||
+			strings.Contains(line, "temporarily unavailable") ||
+			strings.Contains(line, "connection reset") ||
+			strings.Contains(line, "resource exhausted") ||
+			strings.Contains(line, "usage limit reached") ||
+			strings.Contains(line, "context window exceeded") {
 			return true
+		}
+		failureSignal := strings.Contains(line, "error") ||
+			strings.Contains(line, "failed") ||
+			strings.Contains(line, "failure") ||
+			strings.Contains(line, "retry") ||
+			strings.Contains(line, "exceed")
+		if !failureSignal {
+			continue
+		}
+		for _, marker := range []string{"quota", "capacity", "timeout", "timed out", "rate limit", "usage limit"} {
+			if strings.Contains(line, marker) {
+				return true
+			}
 		}
 	}
 	return false
@@ -517,7 +830,7 @@ func writeContextSummary(root, task string, metrics map[string]history.AgentMetr
 	b.WriteString("Files: " + strings.Join(gitutil.ChangedFiles(root), ", ") + "\n")
 	b.WriteString("Agents:\n")
 	for name, metric := range metrics {
-		fmt.Fprintf(&b, "- %s: %s, %d input chars, %d output chars, %s\n", name, metric.Status, metric.InputChars, metric.OutputChars, metric.Duration.Round(time.Millisecond))
+		fmt.Fprintf(&b, "- %s: %s, %d input chars, %d output chars, context=%s, resumed=%t, %s\n", name, metric.Status, metric.InputChars, metric.OutputChars, metric.ContextMode, metric.SessionResumed, metric.Duration.Round(time.Millisecond))
 	}
 	testOutput, _ := os.ReadFile(filepath.Join(root, config.Dir, "state", "test_output.log"))
 	if len(testOutput) > 3000 {
@@ -637,9 +950,6 @@ func (e *Engine) runAgent(ctx context.Context, role, prompt string) (string, err
 	result, err := e.Runner.Run(ctx, e.Root, cli, template, prompt, e.Config.Models[role], logs)
 	close(logs)
 	<-done
-	if err == nil && retryableText(result) {
-		return result, fmt.Errorf("%s agent (%s) reported a retryable quota or capacity failure: %s", role, cli, summarizeAgentError(result))
-	}
 	if err != nil {
 		return result, fmt.Errorf("%s agent (%s) failed: %w", role, cli, err)
 	}
@@ -667,6 +977,23 @@ func errorText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// auditError keeps the durable event ledger concise while preserving the
+// actionable tail of an agent or tool failure. Full transcripts remain in the
+// encrypted attempt log referenced by the event.
+func auditError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return summarizeAgentError(errorText(err))
+}
+
+func statusFromError(err error) string {
+	if err != nil {
+		return "failed"
+	}
+	return "completed"
 }
 
 func completeTask(root, roadmapPath string, lines []string, idx int, task string, state config.State) error {
