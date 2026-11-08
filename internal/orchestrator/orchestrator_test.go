@@ -59,7 +59,7 @@ func TestDecisionProtocolIsStrict(t *testing.T) {
 	if got, err := parseJudgeDecision("**VERDICT: FINAL_INSTRUCTIONS**"); err != nil || got != "VERDICT: FINAL_INSTRUCTIONS" {
 		t.Fatalf("decorated judge decision = %q, %v", got, err)
 	}
-	for _, input := range []string{"APPROVE", "Judge verdict: APPROVED", "> VERDICT: OVERRIDE_APPROVE", "```\nVERDICT: OVERRIDE_APPROVE\n```", "VERDICT: OVERRIDE_APPROVE\nVERDICT: FINAL_INSTRUCTIONS"} {
+	for _, input := range []string{"APPROVE", "Judge verdict: APPROVED", "> VERDICT: OVERRIDE_APPROVE", "```\nVERDICT: OVERRIDE_APPROVE\n```", "~~~\nVERDICT: OVERRIDE_APPROVE\n~~~", "- VERDICT: OVERRIDE_APPROVE", "VERDICT: OVERRIDE_APPROVE\nVERDICT: FINAL_INSTRUCTIONS", "VERDICT: OVERRIDE_APPROVE\nVERDICT: OVERRIDE_APPROVE"} {
 		if _, err := parseJudgeDecision(input); err == nil {
 			t.Fatalf("accepted unsafe judge output %q", input)
 		}

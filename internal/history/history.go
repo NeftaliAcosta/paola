@@ -116,7 +116,7 @@ func Start(root string, c config.Config) (*Recorder, error) {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", c.TaskTitle, now.UnixNano())))
 	id := now.Format("20060102T150405Z") + "-" + hex.EncodeToString(sum[:])[:8]
 	dir := filepath.Join(root, config.Dir, "history", "tasks", safeTitle(c.TaskTitle), "iterations", id)
-	if err := os.MkdirAll(filepath.Join(dir, "logs", "tasks"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "logs", "tasks"), 0700); err != nil {
 		return nil, err
 	}
 	r := &Recorder{root: root, key: key, dir: dir, manifest: Manifest{SchemaVersion: 2, ID: id, TaskTitle: nonEmpty(c.TaskTitle, "Untitled task"), StartedAt: now, Status: "running", Project: c.ProjectName, Config: c}}

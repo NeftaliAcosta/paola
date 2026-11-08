@@ -45,8 +45,43 @@ Export an execution explicitly:
 paola history export <execution-id> --output ./paola-audit-export
 ```
 
-The export decrypts selected audit artifacts, redacts common credential
-patterns, and writes `SHA256SUMS`. Source encrypted history is never modified.
+The default export contains only `manifest.json`, `events.json`,
+`integrity.json`, and `SHA256SUMS`. It validates every referenced encrypted
+artifact but does not decrypt it into the bundle. Use
+`--include-sensitive` only when needed; it exports redacted decrypted
+transcripts, diffs, and test evidence and prints a warning. The destination
+must be new, is created with mode `0700`, and files use `0600`. Traversal,
+absolute paths, symlinks, corrupt/missing references, and partial checksum
+generation are rejected. Source encrypted history is never modified.
+
+## Acceptance evidence
+
+| Criterion | Implementation evidence |
+| --- | --- |
+| Unique execution/task/attempt identity | `Manifest.ID`, event sequence/ID, task index, and attempt-scoped transcript/diff paths |
+| Chronological agent decisions | Append-only persisted `Event` ledger with sequence and UTC timestamp |
+| Reviewer/Judge protocol | Exactly one strict marker; fenced, quoted, bulleted, duplicate, and narrative markers rejected |
+| Test evidence | Encrypted per-attempt JSON reference; `tests_started` has no pre-reference; retries reference persisted evidence |
+| Bonus Coder trace | `agent_started`, `bonus_coder_finished`, test start/finish, final diff, and task finish events |
+| Failure/retry reconstruction | Error, status, attempt, retry event, output reference, and test evidence are persisted |
+| Legacy compatibility | Legacy manifests are synthesized with `synthetic: true`; missing synthetic transcripts are not required |
+| Secure export | Safe metadata-only default, optional redacted sensitive mode, path/symlink validation, atomic failure cleanup, checksums |
+
+## Verdict
+
+`REMEDIATION_PASS`
+
+Release-candidate validation passed:
+
+- `go test ./... -count=1`
+- `go test -race ./... -count=1`
+- `go vet ./...`
+- `go build -o /tmp/paola-audit-build ./cmd/paola`
+- `git diff --check`
+
+The implementation does not claim that historical synthetic events are
+equivalent to original live agent transcripts; that limitation remains
+explicit in the exported metadata.
 
 ## Validation
 

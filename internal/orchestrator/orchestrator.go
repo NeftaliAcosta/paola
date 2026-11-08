@@ -291,7 +291,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 
 			if e.Config.TestCommand != "" {
-				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_started", Status: "running", Evidence: []string{fmt.Sprintf("evidence/tasks/%03d/attempt-%02d-tests.enc", ordinal+1, state.Attempt)}}); err != nil {
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_started", Status: "running"}); err != nil {
 					return err
 				}
 				if err := e.saveCheckpoint(taskCheckpoint{Task: task, TaskIndex: ordinal + 1, Attempt: state.Attempt, Stage: "tests", Status: "running", NextAction: "validation", SessionKeys: e.taskSessions(taskKey)}); err != nil {
@@ -318,7 +318,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 						return err
 					}
 					e.emit("Tests failed; returning to Coder")
-					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "retry_scheduled", Status: "retrying", Error: auditError(testErr), Evidence: []string{"state/test_output.log"}}); err != nil {
+					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "retry_scheduled", Status: "retrying", Error: auditError(testErr), Evidence: []string{testRef}}); err != nil {
 						return err
 					}
 					if summaryErr := writeContextSummary(e.Root, task, metrics); summaryErr != nil {
@@ -489,6 +489,9 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			state.Attempt++
 			coderPrompt, _ := e.prompt("coder", task, taskKey)
 			e.progress(taskList(lines, idx), -1, ordinal+1, state.Attempt, "Coder (bonus)", coder, "FINAL_INSTRUCTIONS")
+			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "coder", Agent: coder, Type: "agent_started", Status: "running"}); err != nil {
+				return err
+			}
 			bonusOutput, err := e.runRole(ctx, "coder", coderPrompt, taskKey, turns, metrics)
 			if saveErr := e.saveSessionState(); saveErr != nil {
 				return fmt.Errorf("persist session state: %w", saveErr)
@@ -506,16 +509,29 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return fmt.Errorf("final coder turn failed: %w", err)
 			}
 			if e.Config.TestCommand != "" {
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_started", Status: "running"}); err != nil {
+					return err
+				}
 				testResult := runTestDetailed(ctx, e.Root, e.Config.TestCommand)
 				testOut, testErr := testResult.Output, testResult.Err
 				if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "test_output.log"), []byte(testOut), 0644); err != nil {
 					return err
 				}
-				if _, evidenceErr := record.LogTestEvidence(ordinal+1, state.Attempt, history.TestEvidence{Command: e.Config.TestCommand, Workdir: e.Root, StartedAt: testResult.StartedAt, FinishedAt: testResult.FinishedAt, Duration: testResult.FinishedAt.Sub(testResult.StartedAt), ExitCode: testResult.ExitCode, Status: statusFromError(testErr), Output: testOut}); evidenceErr != nil {
+				testRef, evidenceErr := record.LogTestEvidence(ordinal+1, state.Attempt, history.TestEvidence{Command: e.Config.TestCommand, Workdir: e.Root, StartedAt: testResult.StartedAt, FinishedAt: testResult.FinishedAt, Duration: testResult.FinishedAt.Sub(testResult.StartedAt), ExitCode: testResult.ExitCode, Status: statusFromError(testErr), Output: testOut})
+				if evidenceErr != nil {
 					return fmt.Errorf("persist final test evidence: %w", evidenceErr)
 				}
 				if testErr != nil {
+					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_finished", Status: "failed", Error: auditError(testErr), Evidence: []string{testRef}}); err != nil {
+						return err
+					}
+					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "task_finished", Status: "failed", Error: auditError(testErr), Evidence: []string{testRef}}); err != nil {
+						return err
+					}
 					return fmt.Errorf("final coder tests failed: %w", testErr)
+				}
+				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "tests_finished", Status: "passed", Evidence: []string{testRef}}); err != nil {
+					return err
 				}
 			}
 			finalDiff, err := gitutil.CaptureDiffSince(e.Root, taskBase)
@@ -1143,11 +1159,11 @@ func parseDecision(output string, markers ...string) (string, error) {
 	fenced := false
 	for _, raw := range strings.Split(output, "\n") {
 		line := strings.TrimSpace(raw)
-		if strings.HasPrefix(line, "```") {
+		if strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~") {
 			fenced = !fenced
 			continue
 		}
-		if fenced || strings.HasPrefix(line, ">") || strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") {
+		if fenced || strings.HasPrefix(line, ">") || strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") || strings.HasPrefix(line, "+ ") {
 			continue
 		}
 		line = strings.TrimSpace(strings.Trim(line, "*_`# "))

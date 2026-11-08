@@ -24,18 +24,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const version = "0.1.16"
+const version = "0.1.17"
 
 var (
-	headless            bool
-	worktree            bool
-	baseBranch          string
-	simulate            bool
-	contextFile         string
-	objectiveFile       string
-	roadmapFile         string
-	rulesFile           string
-	historyExportOutput string
+	headless               bool
+	worktree               bool
+	baseBranch             string
+	simulate               bool
+	contextFile            string
+	objectiveFile          string
+	roadmapFile            string
+	rulesFile              string
+	historyExportOutput    string
+	historyExportSensitive bool
 )
 var rootCmd = &cobra.Command{Use: "paola", Short: "Polymorphic Autonomous Orchestrator for Local Agents", Version: version, SilenceUsage: true}
 
@@ -104,9 +105,13 @@ func init() {
 		if historyExportOutput == "" {
 			return fmt.Errorf("--output is required")
 		}
-		return paolahistory.Export(r, args[0], historyExportOutput)
+		if historyExportSensitive {
+			fmt.Fprintln(os.Stderr, "Warning: --include-sensitive exports decrypted, redacted artifacts. Review and protect the destination.")
+		}
+		return paolahistory.ExportWithOptions(r, args[0], historyExportOutput, paolahistory.ExportOptions{IncludeSensitive: historyExportSensitive})
 	}}
 	exportCmd.Flags().StringVarP(&historyExportOutput, "output", "o", "", "directory for the exported audit bundle")
+	exportCmd.Flags().BoolVar(&historyExportSensitive, "include-sensitive", false, "include redacted decrypted transcripts, diffs, and test evidence")
 	historyCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(historyCmd)
 	rootCmd.AddCommand(&cobra.Command{Use: "update", Short: "Check self-update status", RunE: func(*cobra.Command, []string) error {
