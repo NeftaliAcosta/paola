@@ -117,6 +117,29 @@ func (e *Engine) emit(s string) {
 	}
 }
 
+func (e *Engine) emitEvent(event string, fields ...string) {
+	symbol := "·"
+	switch event {
+	case "task_started", "agent_started":
+		symbol = "▶"
+	case "task_skipped":
+		symbol = "↷"
+	case "retry_scheduled", "review_changes_requested":
+		symbol = "↻"
+	case "tests_failed", "agent_failed":
+		symbol = "✗"
+	case "review_approved", "judge_approved", "agent_completed", "execution_completed":
+		symbol = "✓"
+	case "session_unavailable":
+		symbol = "⚠"
+	}
+	parts := []string{symbol, "event=" + strconv.Quote(event)}
+	for i := 0; i+1 < len(fields); i += 2 {
+		parts = append(parts, fields[i]+"="+strconv.Quote(fields[i+1]))
+	}
+	e.emit(strings.Join(parts, " "))
+}
+
 func (e *Engine) Run(ctx context.Context) (runErr error) {
 	roadmapPath := filepath.Join(e.Root, config.Dir, "ROADMAP.md")
 	b, err := os.ReadFile(roadmapPath)
@@ -225,7 +248,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			return err
 		}
 		e.progress(taskList(lines, idx), -1, ordinal+1, 0, "", "", "")
-		e.emit("▶ " + task)
+		e.emitEvent("task_started", "task", task, "task_index", strconv.Itoa(ordinal+1))
 
 		completed := false
 		reviewRounds := 0
@@ -237,7 +260,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return err
 			}
 			if e.Control != nil && e.Control.ConsumeSkip() {
-				e.emit("↷ skipped: " + task)
+				e.emitEvent("task_skipped", "task", task, "task_index", strconv.Itoa(ordinal+1))
 				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "task_finished", Status: "skipped"}); err != nil {
 					return err
 				}
@@ -255,7 +278,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 			prompt, _ := e.prompt("coder", task, taskKey)
 			_ = os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "current_prompt.md"), []byte(prompt), 0600)
-			e.emit(fmt.Sprintf("Coder attempt %d/%d (%s)", state.Attempt, maxRetries, coder))
+			e.emitEvent("agent_started", "role", "coder", "agent", coder, "attempt", strconv.Itoa(state.Attempt), "max_attempts", strconv.Itoa(maxRetries))
 			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "coder", Agent: coder, Type: "agent_started", Status: "running"}); err != nil {
 				return err
 			}
@@ -281,7 +304,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 					if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "coder", Agent: coder, Type: "retry_scheduled", Status: "retrying", Error: auditError(err)}); eventErr != nil {
 						return eventErr
 					}
-					e.emit(fmt.Sprintf("Retryable coder failure; retrying in %ds", e.Config.EffectiveRetryBackoffSeconds()))
+					e.emitEvent("retry_scheduled", "role", "coder", "delay_seconds", strconv.Itoa(e.Config.EffectiveRetryBackoffSeconds()))
 					if err := waitBackoff(ctx, e.Config.EffectiveRetryBackoffSeconds()); err != nil {
 						return err
 					}
@@ -317,7 +340,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 					if err := os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(testOut), 0644); err != nil {
 						return err
 					}
-					e.emit("Tests failed; returning to Coder")
+					e.emitEvent("tests_failed", "next_role", "coder", "attempt", strconv.Itoa(state.Attempt))
 					if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "retry_scheduled", Status: "retrying", Error: auditError(testErr), Evidence: []string{testRef}}); err != nil {
 						return err
 					}
@@ -364,7 +387,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return err
 			}
 			reviewPrompt, _ := e.prompt("reviewer", task, taskKey)
-			e.emit("Reviewer (" + reviewer + ")")
+			e.emitEvent("agent_started", "role", "reviewer", "agent", reviewer, "attempt", strconv.Itoa(state.Attempt))
 			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "agent_started", Status: "running", Evidence: []string{fmt.Sprintf("diffs/task-%03d-attempt-%02d.patch.enc", ordinal+1, state.Attempt)}}); err != nil {
 				return err
 			}
@@ -391,7 +414,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 					if eventErr := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "reviewer", Agent: reviewer, Type: "retry_scheduled", Status: "retrying", Error: auditError(err)}); eventErr != nil {
 						return eventErr
 					}
-					e.emit(fmt.Sprintf("Retryable reviewer failure; retrying in %ds", e.Config.EffectiveRetryBackoffSeconds()))
+					e.emitEvent("retry_scheduled", "role", "reviewer", "delay_seconds", strconv.Itoa(e.Config.EffectiveRetryBackoffSeconds()))
 					if err := waitBackoff(ctx, e.Config.EffectiveRetryBackoffSeconds()); err != nil {
 						return err
 					}
@@ -415,14 +438,14 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 			}
 			if decisionStatus == "approved" {
 				completed = true
-				e.emit("✓ reviewer approved")
+				e.emitEvent("review_approved", "role", "reviewer", "agent", reviewer)
 				break
 			}
 			if state.Attempt < maxRetries {
 				if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Type: "retry_scheduled", Status: "retrying", Error: "reviewer requested changes"}); err != nil {
 					return err
 				}
-				e.emit("Reviewer requested changes")
+				e.emitEvent("review_changes_requested", "role", "reviewer", "agent", reviewer)
 				if summaryErr := writeContextSummary(e.Root, task, metrics); summaryErr != nil {
 					return summaryErr
 				}
@@ -435,7 +458,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return err
 			}
 			judgePrompt, _ := e.prompt("judge", task, taskKey)
-			e.emit("Judge (" + judge + ")")
+			e.emitEvent("agent_started", "role", "judge", "agent", judge, "attempt", strconv.Itoa(state.Attempt))
 			if err := record.Event(history.Event{TaskIndex: ordinal + 1, Task: task, Attempt: state.Attempt, Role: "judge", Agent: judge, Type: "agent_started", Status: "running"}); err != nil {
 				return err
 			}
@@ -472,7 +495,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 					return err
 				}
 				completed = true
-				e.emit("✓ judge approved")
+				e.emitEvent("judge_approved", "agent", judge)
 				break
 			}
 			if judgeDecision != "VERDICT: FINAL_INSTRUCTIONS" {
@@ -482,7 +505,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return err
 			}
 			// The Judge's synthesis becomes feedback for exactly one final Coder turn.
-			e.emit("Judge issued final instructions; starting bonus Coder turn")
+			e.emitEvent("judge_final_instructions", "next_role", "coder", "turn", "bonus")
 			if err := e.wait(ctx); err != nil {
 				return err
 			}
@@ -545,7 +568,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 				return fmt.Errorf("persist final task %d attempt %d diff: %w", ordinal+1, state.Attempt, err)
 			}
 			completed = true
-			e.emit("✓ final coder turn complete")
+			e.emitEvent("agent_completed", "role", "coder", "turn", "bonus")
 		}
 		if completed {
 			if err := record.UpdateTask(ordinal+1, "completed", "", taskTokenCount(e.Root, metrics), gitutil.ChangedFilesSince(e.Root, taskBase), state.Attempt, reviewRounds); err != nil {
@@ -577,7 +600,7 @@ func (e *Engine) Run(ctx context.Context) (runErr error) {
 	runStatus = "completed"
 	state.Attempt = 0
 	if e.TaskBranch != "" {
-		e.emit(fmt.Sprintf("All tasks completed on branch '%s'. Review your changes with 'git log' or merge into '%s'.", e.TaskBranch, e.BaseBranch))
+		e.emitEvent("execution_completed", "task_branch", e.TaskBranch, "base_branch", e.BaseBranch)
 	}
 	e.progress(taskList(lines, -1), -1, len(indexes), 0, "", "", "complete")
 	return config.SaveState(e.Root, state)
@@ -708,7 +731,7 @@ func (e *Engine) runRole(ctx context.Context, role, prompt, taskKey string, turn
 		// Session IDs can expire or become incompatible after a CLI update. Do
 		// not burn the whole task: start one clean provider turn using the
 		// durable checkpoint already embedded in the compact prompt.
-		e.emit(fmt.Sprintf("Session %s unavailable; starting a fresh %s turn from checkpoint", providerSessionID, role))
+		e.emitEvent("session_unavailable", "session_id", providerSessionID, "role", role, "recovery", "fresh_turn_from_checkpoint")
 		freshCtx := agent.WithSessionTemplate(agent.WithSession(roleCtx, ""), "")
 		rawOutput, err = e.runAgent(freshCtx, role, prompt)
 		contextMode = "checkpoint_fallback"
@@ -736,7 +759,7 @@ func (e *Engine) runRole(ctx context.Context, role, prompt, taskKey string, turn
 		status = "failed"
 		message := fmt.Sprintf("%s failed: %v\n\nRecovery: inspect the last output, correct the agent configuration or quota issue, then rerun the pending task.", role, err)
 		_ = os.WriteFile(filepath.Join(e.Root, config.Dir, "state", "feedback.md"), []byte(message), 0644)
-		e.emit("✗ " + message)
+		e.emitEvent("agent_failed", "message", message, "role", role)
 	}
 	inputTokens, outputTokens := parseTokenMetrics(rawOutput)
 	metrics[key] = history.AgentMetric{Role: role, CLI: e.Config.Agents[role], Model: e.Config.Models[role], Effort: budget.Effort, Turns: turns[role], InputChars: len(prompt), OutputChars: len(rawOutput), InputTokens: inputTokens, OutputTokens: outputTokens, EstimatedTokens: estimateTokens(prompt) + estimateTokens(rawOutput), Duration: time.Since(started), Status: status, Retryable: retryableError(err), Error: errorText(err), SessionID: e.Sessions[e.sessionKey(taskKey, role)], ContextMode: contextMode, SessionResumed: sessionResumed, FallbackUsed: fallbackUsed}

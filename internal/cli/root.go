@@ -220,8 +220,8 @@ func configEditCommand(*cobra.Command, []string) error {
 			options = append(options, huh.NewOption(label, name))
 		}
 		if err := huh.NewForm(huh.NewGroup(
-			huh.NewSelect[string]().Title("CLI para " + role).Options(options...).Value(&current),
-		).Title("PAOLA · Roles").Description("Selecciona el CLI que ejecutará este rol.")).Run(); err != nil {
+			huh.NewSelect[string]().Title("CLI for " + role).Options(options...).Value(&current),
+		).Title("PAOLA · Roles").Description("Choose the CLI that will run this role.")).Run(); err != nil {
 			return err
 		}
 		selected[role] = current
@@ -229,8 +229,8 @@ func configEditCommand(*cobra.Command, []string) error {
 
 		model := c.Models[role]
 		if err := huh.NewForm(huh.NewGroup(
-			huh.NewInput().Title("Modelo para " + role + " (opcional)").Description("Vacío = modelo predeterminado del CLI.").Value(&model),
-		).Title("PAOLA · Modelos")).Run(); err != nil {
+			huh.NewInput().Title("Model for " + role + " (optional)").Description("Leave blank to use the CLI default model.").Value(&model),
+		).Title("PAOLA · Models")).Run(); err != nil {
 			return err
 		}
 		c.Models[role] = strings.TrimSpace(model)
@@ -238,8 +238,8 @@ func configEditCommand(*cobra.Command, []string) error {
 		budget := c.Budget(role)
 		effort := budget.Effort
 		if err := huh.NewForm(huh.NewGroup(
-			huh.NewSelect[string]().Title("Esfuerzo para " + role).Options(huh.NewOptions("low", "medium", "high")...).Value(&effort),
-		).Title("PAOLA · Esfuerzo").Description("Controla el esfuerzo solicitado al agente cuando el CLI lo admite.")).Run(); err != nil {
+			huh.NewSelect[string]().Title("Effort for " + role).Options(huh.NewOptions("low", "medium", "high")...).Value(&effort),
+		).Title("PAOLA · Effort").Description("Controls the effort requested from the agent when supported by the CLI.")).Run(); err != nil {
 			return err
 		}
 		budget.Effort = effort
@@ -248,8 +248,8 @@ func configEditCommand(*cobra.Command, []string) error {
 
 	refresh := true
 	if err := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().Title("¿Actualizar plantillas de comando?").Description("Reemplaza las plantillas de los roles seleccionados por las compatibles con cada CLI y corrige opciones obsoletas.").Affirmative("Sí, actualizar").Negative("No, conservar").Value(&refresh),
-	).Title("PAOLA · Plantillas")).Run(); err != nil {
+		huh.NewConfirm().Title("Update command templates?").Description("Replace templates for selected roles with CLI-compatible versions and remove obsolete options.").Affirmative("Yes, update").Negative("No, keep current").Value(&refresh),
+	).Title("PAOLA · Templates")).Run(); err != nil {
 		return err
 	}
 	if refresh {
